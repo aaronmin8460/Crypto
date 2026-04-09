@@ -1,8 +1,12 @@
 from __future__ import annotations
 
-import httpx
+import asyncio
+import logging
+from httpx import AsyncClient, HTTPError
 
 from app.config.settings import AppSettings
+
+logger = logging.getLogger(__name__)
 
 
 class AlpacaTrading:
@@ -15,15 +19,24 @@ class AlpacaTrading:
         }
 
     async def _request(self, method: str, path: str, params: dict | None = None, json: dict | None = None) -> dict | list:
-        url = f"{self.settings.alpaca_base_url}{path}"
-        async with httpx.AsyncClient(headers=self.headers, timeout=20.0) as client:
-            response = await client.request(method, url, params=params, json=json)
+        if self.settings.is_live_mode and not self.settings.allow_live_trading:
+            raise RuntimeError("live trading is disabled by configuration")
 
-        if response.status_code >= 400:
-            raise RuntimeError(
-                f"Alpaca trading request failed: {response.status_code} {response.text}"
-            )
-        return response.json()
+        url = f"{self.settings.alpaca_base_url}{path}"
+        for attempt in range(2):
+            try:
+                async with AsyncClient(headers=self.headers, timeout=20.0) as client:
+                    response = await client.request(method, url, params=params, json=json)
+                if response.status_code >= 400:
+                    raise RuntimeError(
+                        f"Alpaca trading request failed: {response.status_code} {response.text}"
+                    )
+                return response.json()
+            except HTTPError as exc:
+                logger.warning("Alpaca request failed on attempt %d: %s", attempt + 1, exc)
+                if attempt == 1:
+                    raise RuntimeError(f"Alpaca trading request failed: {exc}") from exc
+                await asyncio.sleep(1)
 
     async def get_account(self) -> dict:
         return await self._request("GET", "/v2/account")

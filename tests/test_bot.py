@@ -12,11 +12,12 @@ def test_bot_run_once_places_buy_and_cools_down():
         alpaca_secret_key="test-secret",
         default_symbols=["BTC/USD"],
         cooldown_seconds_per_symbol=900,
+        trading_enabled=True,
     )
 
     data_service = AsyncMock()
     trading_service = AsyncMock()
-    trading_service.get_account.return_value = {"cash": "200"}
+    trading_service.get_account.return_value = {"cash": "200", "status": "ACTIVE"}
     trading_service.list_positions.return_value = []
     trading_service.submit_market_buy_notional.return_value = {"id": "order123"}
 

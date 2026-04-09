@@ -42,3 +42,41 @@ def test_bot_control_endpoints():
         assert response.status_code == 200
         assert response.json() == {"status": "stopped"}
         stop_mock.assert_awaited_once()
+
+
+def test_bot_halt_and_resume_endpoints():
+    client = TestClient(app)
+    with patch.object(app.state.bot, "halt", AsyncMock()) as halt_mock:
+        response = client.post("/bot/halt")
+        assert response.status_code == 200
+        assert response.json()["status"] == "halted"
+        halt_mock.assert_awaited_once()
+
+    with patch.object(app.state.bot, "resume", AsyncMock()) as resume_mock:
+        response = client.post("/bot/resume")
+        assert response.status_code == 200
+        assert response.json() == {"status": "resumed"}
+        resume_mock.assert_awaited_once()
+
+
+def test_bot_log_summary_endpoint():
+    client = TestClient(app)
+    with patch.object(app.state.bot, "status", return_value={
+        "running": False,
+        "mode": "paper",
+        "trading_enabled": False,
+        "halted_reason": None,
+        "last_run_time": None,
+        "last_error": None,
+        "last_results": {},
+        "cooldowns": {},
+        "risk_profile": {},
+        "daily_order_count": 0,
+        "daily_realized_pnl": 0.0,
+        "last_signal_by_symbol": {},
+        "last_order_by_symbol": {},
+    }):
+        response = client.get("/bot/log-summary")
+
+    assert response.status_code == 200
+    assert response.json()["mode"] == "paper"

@@ -59,3 +59,16 @@ def test_app_settings_reads_uppercase_dotenv_file(tmp_path, monkeypatch):
     assert settings.paper_trading is True
     assert settings.scan_interval_seconds == 30
     assert settings.order_notional_usd == 150.0
+
+
+def test_live_broker_mode_requires_allow_live_trading():
+    settings = AppSettings(
+        broker_mode="live",
+        trading_enabled=True,
+        allow_live_trading=False,
+    )
+
+    assert settings.is_live_mode is True
+    assert settings.trading_allowed is False
+    assert settings.alpaca_base_url == "https://api.alpaca.markets"
+    assert settings.paper_trading is False

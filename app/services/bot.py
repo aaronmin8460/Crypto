@@ -9,7 +9,7 @@ from app.config.settings import AppSettings
 from app.services.alpaca_crypto_data import AlpacaCryptoData
 from app.services.alpaca_trading import AlpacaTrading
 from app.services.state import BotState
-from app.services.strategy import SignalResult, evaluate_signal
+from app.services.strategy import evaluate_signal
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +24,7 @@ class TradingBot:
         self.settings = settings
         self.data_service = data_service
         self.trading_service = trading_service
-        self.state = BotState()
+        self.state = BotState(mode=settings.broker_mode, trading_enabled=settings.trading_enabled)
         self._task: asyncio.Task | None = None
         self._lock = asyncio.Lock()
         self._stop_event = asyncio.Event()
@@ -33,13 +33,43 @@ class TradingBot:
         async with self._lock:
             run_time = datetime.now(timezone.utc)
             self.state.set_error(None)
-            results: list[dict] = []
+            self.state.mode = self.settings.broker_mode
+            self.state.trading_enabled = self.settings.trading_enabled
+            self.state.reset_daily()
 
             account = await self.trading_service.get_account()
             positions = await self.trading_service.list_positions()
             position_map = {pos["symbol"]: pos for pos in positions}
             cash = Decimal(str(account.get("cash", "0")))
+            self.state.record_cash_change(cash)
             open_positions = len(positions)
+            results: list[dict] = []
+
+            if self.state.halted_reason:
+                reason = f"trading halted: {self.state.halted_reason}"
+                logger.warning(reason)
+                for symbol in self.settings.default_symbols:
+                    results.append(
+                        {
+                            "symbol": symbol,
+                            "signal": "HOLD",
+                            "reason": reason,
+                            "order": None,
+                        }
+                    )
+                return self._build_response(run_time, results, account, positions)
+
+            if self.settings.require_healthy_account and account.get("status") != "ACTIVE":
+                self.state.halted_reason = "account not healthy"
+                logger.warning("halting bot because account status is not ACTIVE: %s", account.get("status"))
+                return self._build_response(run_time, results, account, positions)
+
+            if self.settings.is_live_mode and self.settings.trading_allowed and (
+                not self.settings.alpaca_api_key or not self.settings.alpaca_secret_key
+            ):
+                self.state.halted_reason = "live trading credentials missing"
+                logger.warning("halting live trading because API credentials are missing")
+                return self._build_response(run_time, results, account, positions)
 
             for symbol in self.settings.default_symbols:
                 symbol_result: dict = {
@@ -51,6 +81,7 @@ class TradingBot:
 
                 if not self.state.can_trade(symbol):
                     symbol_result["reason"] = "cooldown active"
+                    logger.info("skip %s because cooldown is active", symbol)
                     results.append(symbol_result)
                     continue
 
@@ -61,18 +92,30 @@ class TradingBot:
                     signal = evaluate_signal(bars)
                 except Exception as exc:
                     symbol_result["reason"] = f"signal error: {exc}"
+                    logger.warning("signal error for %s: %s", symbol, exc)
                     results.append(symbol_result)
                     continue
 
                 symbol_result["signal"] = signal.signal
                 symbol_result["reason"] = signal.reason
+                self.state.record_signal(symbol, signal.signal)
 
                 held_position = position_map.get(symbol)
                 if signal.signal == "BUY":
-                    if held_position is not None:
+                    if not self.settings.trading_allowed:
+                        symbol_result["reason"] = "trading disabled"
+                    elif held_position is not None:
                         symbol_result["reason"] = "already holding symbol"
+                    elif self.state.daily_order_count >= self.settings.max_daily_orders:
+                        symbol_result["reason"] = "daily order limit reached"
+                    elif self.state.daily_realized_pnl <= -abs(self.settings.max_daily_loss_usd):
+                        self.state.halted_reason = "max daily loss exceeded"
+                        symbol_result["reason"] = "halted by max daily loss"
+                        logger.warning("max daily loss exceeded: %.2f", self.state.daily_realized_pnl)
                     elif open_positions >= self.settings.max_open_positions:
                         symbol_result["reason"] = "max open positions reached"
+                    elif self.settings.order_notional_usd > self.settings.max_position_notional_usd:
+                        symbol_result["reason"] = "order amount exceeds max position notional"
                     elif cash < Decimal(str(self.settings.order_notional_usd)):
                         symbol_result["reason"] = "not enough cash"
                     else:
@@ -82,9 +125,13 @@ class TradingBot:
                         symbol_result["order"] = order
                         symbol_result["reason"] = "buy order submitted"
                         self.state.record_trade(symbol, self.settings.cooldown_seconds_per_symbol)
+                        self.state.record_order(symbol, order)
+                        logger.info("submitted buy order for %s: %s", symbol, order)
 
                 elif signal.signal == "SELL":
-                    if held_position is None:
+                    if not self.settings.trading_allowed:
+                        symbol_result["reason"] = "trading disabled"
+                    elif held_position is None:
                         symbol_result["reason"] = "no position to exit"
                     else:
                         qty = float(held_position.get("qty", 0))
@@ -95,17 +142,25 @@ class TradingBot:
                             symbol_result["order"] = order
                             symbol_result["reason"] = "sell order submitted"
                             self.state.record_trade(symbol, self.settings.cooldown_seconds_per_symbol)
+                            self.state.record_order(symbol, order)
+                            logger.info("submitted sell order for %s: %s", symbol, order)
+
+                else:
+                    logger.info("no trade signal for %s: %s", symbol, signal.reason)
 
                 results.append(symbol_result)
 
-            self.state.last_run_time = run_time
-            self.state.last_results = {"symbols": results}
-            return {
-                "run_time": run_time,
-                "results": results,
-                "account": account,
-                "positions": positions,
-            }
+            return self._build_response(run_time, results, account, positions)
+
+    def _build_response(self, run_time: datetime, results: list[dict], account: dict, positions: list[dict]) -> dict:
+        self.state.last_run_time = run_time
+        self.state.last_results = {"symbols": results}
+        return {
+            "run_time": run_time,
+            "results": results,
+            "account": account,
+            "positions": positions,
+        }
 
     async def _run_loop(self) -> None:
         try:
@@ -143,12 +198,28 @@ class TradingBot:
             self._task = None
         logger.info("bot stopped")
 
+    async def halt(self, reason: str = "manual emergency stop") -> None:
+        self.state.halt(reason)
+        await self.stop()
+        logger.warning("bot halted: %s", reason)
+
+    async def resume(self) -> None:
+        self.state.resume()
+        logger.info("bot resume requested")
+
     def status(self) -> dict:
         return {
             "running": self.state.running,
+            "mode": self.state.mode,
+            "trading_enabled": self.state.trading_enabled,
+            "halted_reason": self.state.halted_reason,
             "last_run_time": self.state.last_run_time,
             "last_error": self.state.last_error,
             "last_results": self.state.last_results,
             "cooldowns": self.state.cooldowns,
             "risk_profile": self.state.risk_profile,
+            "daily_order_count": self.state.daily_order_count,
+            "daily_realized_pnl": self.state.daily_realized_pnl,
+            "last_signal_by_symbol": self.state.last_signal_by_symbol,
+            "last_order_by_symbol": self.state.last_order_by_symbol,
         }

@@ -55,8 +55,19 @@ def test_bot_halt_and_resume_endpoints():
     with patch.object(app.state.bot, "resume", AsyncMock()) as resume_mock:
         response = client.post("/bot/resume")
         assert response.status_code == 200
-        assert response.json() == {"status": "resumed"}
+        assert response.json()["status"] == "resumed"
+        assert response.json()["halted_reason"] is None
+        assert response.json()["risk_stop_latched"] is False
         resume_mock.assert_awaited_once()
+
+
+def test_bot_reset_risk_endpoint():
+    client = TestClient(app)
+    with patch.object(app.state.bot, "reset_risk", AsyncMock()) as reset_mock:
+        response = client.post("/bot/reset-risk")
+        assert response.status_code == 200
+        assert response.json()["status"] == "risk reset"
+        reset_mock.assert_awaited_once()
 
 
 def test_bot_log_summary_endpoint():
@@ -80,6 +91,38 @@ def test_bot_log_summary_endpoint():
 
     assert response.status_code == 200
     assert response.json()["mode"] == "paper"
+
+
+def test_bot_status_returns_risk_fields():
+    client = TestClient(app)
+    with patch.object(app.state.bot, "status", return_value={
+        "running": True,
+        "mode": "paper",
+        "trading_enabled": True,
+        "halted_reason": None,
+        "last_run_time": None,
+        "last_loop_time": None,
+        "last_error": None,
+        "consecutive_failures": 0,
+        "last_results": {},
+        "cooldowns": {},
+        "open_orders": {},
+        "risk_profile": {},
+        "daily_order_count": 0,
+        "daily_equity_drawdown_usd": 0.0,
+        "day_peak_equity": 100000.0,
+        "current_equity_drawdown_usd": 0.0,
+        "max_intraday_drawdown_usd": 0.0,
+        "risk_stop_latched": False,
+        "total_portfolio_exposure_usd": 0.0,
+        "daily_symbol_trade_count": {},
+        "last_signal_by_symbol": {},
+        "last_order_by_symbol": {},
+    }):
+        response = client.get("/bot/status")
+
+    assert response.status_code == 200
+    assert response.json()["day_peak_equity"] == 100000.0
 
 
 def test_metrics_endpoint_returns_summary():

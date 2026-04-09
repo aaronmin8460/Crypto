@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import date, datetime, timezone
+from decimal import Decimal
 from unittest.mock import AsyncMock, patch
 
 import pandas as pd
@@ -92,7 +93,10 @@ def test_max_daily_loss_halts_trading():
     settings = AppSettings(broker_mode="paper", trading_enabled=True, max_daily_loss_usd=150)
     bot = TradingBot(settings, AsyncMock(spec=AlpacaCryptoData), AsyncMock(spec=AlpacaTrading))
     bot.state.daily_order_date = date.today()
-    bot.state.last_equity = 10151.0  # Set starting equity so drawdown will be 151
+    bot.state.day_peak_equity = 10151.0
+    bot.state.last_equity = 10151.0
+    bot.state.current_equity_drawdown_usd = 0.0
+    bot.state.max_intraday_drawdown_usd = 0.0
     bot.state.daily_equity_drawdown_usd = 0.0
 
     bot.data_service.fetch_bars = AsyncMock(return_value=sample_bars_df())
@@ -104,7 +108,90 @@ def test_max_daily_loss_halts_trading():
         result = asyncio.run(bot.run_once())
 
     assert bot.state.halted_reason == "max daily loss exceeded"
-    assert result["results"][0]["reason"] == "halted by max daily loss"
+    assert result["results"][0]["reason"] == "trading halted: max daily loss exceeded"
+
+
+def test_record_equity_change_initializes_drawdown_state():
+    state = TradingBot(AppSettings(broker_mode="paper", trading_enabled=True), AsyncMock(), AsyncMock()).state
+    state.record_equity_change(Decimal("100000"))
+
+    assert state.day_peak_equity == 100000.0
+    assert state.current_equity_drawdown_usd == 0.0
+    assert state.max_intraday_drawdown_usd == 0.0
+    assert state.daily_equity_drawdown_usd == 0.0
+
+
+def test_record_equity_change_updates_peak_and_drawdown():
+    state = TradingBot(AppSettings(broker_mode="paper", trading_enabled=True), AsyncMock(), AsyncMock()).state
+    state.record_equity_change(Decimal("100000"))
+    state.record_equity_change(Decimal("101000"))
+
+    assert state.day_peak_equity == 101000.0
+    assert state.current_equity_drawdown_usd == 0.0
+    assert state.max_intraday_drawdown_usd == 0.0
+
+    state.record_equity_change(Decimal("100200"))
+    assert state.day_peak_equity == 101000.0
+    assert state.current_equity_drawdown_usd == 800.0
+    assert state.max_intraday_drawdown_usd == 800.0
+
+    state.record_equity_change(Decimal("100500"))
+    assert state.current_equity_drawdown_usd == 500.0
+    assert state.max_intraday_drawdown_usd == 800.0
+
+
+def test_resume_does_not_clear_daily_loss_latch():
+    settings = AppSettings(broker_mode="paper", trading_enabled=True, max_daily_loss_usd=150)
+    bot = TradingBot(settings, AsyncMock(spec=AlpacaCryptoData), AsyncMock(spec=AlpacaTrading))
+    bot.state.daily_order_date = date.today()
+    bot.state.risk_stop_latched = True
+    bot.state.halted_reason = "max daily loss exceeded"
+
+    asyncio.run(bot.resume())
+    assert bot.state.halted_reason == "max daily loss exceeded"
+    assert bot.state.risk_stop_latched is True
+
+
+def test_reset_risk_clears_daily_loss_stop():
+    settings = AppSettings(broker_mode="paper", trading_enabled=True)
+    trading = AsyncMock(spec=AlpacaTrading)
+    trading.get_account.return_value = {"cash": "1000", "equity": "100000", "status": "ACTIVE"}
+    bot = TradingBot(settings, AsyncMock(spec=AlpacaCryptoData), trading)
+    bot.state.risk_stop_latched = True
+    bot.state.halted_reason = "max daily loss exceeded"
+
+    asyncio.run(bot.reset_risk())
+
+    assert bot.state.risk_stop_latched is False
+    assert bot.state.halted_reason is None
+    assert bot.state.day_peak_equity == 100000.0
+    assert bot.state.current_equity_drawdown_usd == 0.0
+
+
+def test_stale_persisted_drawdown_does_not_block_after_reset():
+    settings = AppSettings(broker_mode="paper", trading_enabled=True, max_daily_loss_usd=150)
+    trading = AsyncMock(spec=AlpacaTrading)
+    trading.get_account.return_value = {"cash": "1000", "equity": "100000", "status": "ACTIVE"}
+    bot = TradingBot(settings, AsyncMock(spec=AlpacaCryptoData), trading)
+    bot.state.daily_order_date = date.today()
+    bot.state.daily_equity_drawdown_usd = 151.0
+    bot.state.day_peak_equity = None
+    bot.state.max_intraday_drawdown_usd = 0.0
+    bot.state.risk_stop_latched = False
+
+    bot.state.record_equity_change(Decimal("100000"))
+    assert bot.state.current_equity_drawdown_usd == 0.0
+    assert bot.state.max_intraday_drawdown_usd == 0.0
+    assert bot.state.risk_stop_latched is False
+
+    bot.data_service.fetch_bars = AsyncMock(return_value=sample_bars_df())
+    bot.trading_service.list_positions.return_value = []
+    bot.trading_service.submit_market_buy_notional = AsyncMock(return_value={"filled_avg_price": "100.0"})
+
+    with patch("app.services.bot.evaluate_signal", return_value=SignalResult(signal="BUY", reason="crossed up")):
+        result = asyncio.run(bot.run_once())
+
+    assert result["results"][0]["reason"] != "halted by max daily loss"
 
 
 def test_bot_halt_and_resume_changes_state():

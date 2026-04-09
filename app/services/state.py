@@ -24,6 +24,10 @@ class BotState(BaseModel):
     daily_order_count: int = 0
     daily_symbol_trade_count: dict[str, int] = Field(default_factory=dict)
     daily_equity_drawdown_usd: float = 0.0
+    day_peak_equity: float | None = None
+    current_equity_drawdown_usd: float = 0.0
+    max_intraday_drawdown_usd: float = 0.0
+    risk_stop_latched: bool = False
     total_portfolio_exposure_usd: float = 0.0
     daily_order_date: date | None = None
     last_equity: float | None = None
@@ -89,13 +93,26 @@ class BotState(BaseModel):
 
     def record_equity_change(self, equity: Decimal) -> None:
         equity_value = float(equity)
-        if self.last_equity is not None:
-            drawdown = self.last_equity - equity_value
-            if drawdown > 0:
-                self.daily_equity_drawdown_usd = max(self.daily_equity_drawdown_usd, drawdown)
+        if self.day_peak_equity is None:
+            self.day_peak_equity = equity_value
+            self.current_equity_drawdown_usd = 0.0
+            self.max_intraday_drawdown_usd = 0.0
         else:
-            self.last_equity = equity_value
-            self.daily_equity_drawdown_usd = 0.0
+            self.day_peak_equity = max(self.day_peak_equity, equity_value)
+            self.current_equity_drawdown_usd = max(0.0, self.day_peak_equity - equity_value)
+            self.max_intraday_drawdown_usd = max(self.max_intraday_drawdown_usd, self.current_equity_drawdown_usd)
+
+        self.daily_equity_drawdown_usd = self.current_equity_drawdown_usd
+        self.last_equity = equity_value
+
+    def reset_risk_state(self, current_equity: float | None = None) -> None:
+        if current_equity is not None:
+            self.day_peak_equity = current_equity
+            self.last_equity = current_equity
+        self.current_equity_drawdown_usd = 0.0
+        self.max_intraday_drawdown_usd = 0.0
+        self.daily_equity_drawdown_usd = 0.0
+        self.risk_stop_latched = False
 
     def reset_daily(self) -> None:
         today = date.today()
@@ -104,8 +121,14 @@ class BotState(BaseModel):
             self.daily_order_count = 0
             self.daily_symbol_trade_count.clear()
             self.daily_equity_drawdown_usd = 0.0
+            self.day_peak_equity = None
+            self.current_equity_drawdown_usd = 0.0
+            self.max_intraday_drawdown_usd = 0.0
+            self.risk_stop_latched = False
             self.last_equity = None
             self.position_entry_price.clear()
+            if self.halted_reason == "max daily loss exceeded":
+                self.halted_reason = None
 
     def set_error(self, message: str | None) -> None:
         self.last_error = message
@@ -114,4 +137,6 @@ class BotState(BaseModel):
         self.halted_reason = reason
 
     def resume(self) -> None:
+        if self.risk_stop_latched and self.halted_reason == "max daily loss exceeded":
+            return
         self.halted_reason = None

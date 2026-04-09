@@ -52,7 +52,8 @@ If port `8000` is already in use, add `--port 8001`.
 - `POST /bot/start` launches the continuous background loop
 - `POST /bot/stop` stops the background loop cleanly
 - `POST /bot/halt` pauses trading with an emergency reason
-- `POST /bot/resume` clears the halt state
+- `POST /bot/resume` clears a manual halt state
+- `POST /bot/reset-risk` clears a daily loss stop and recomputes risk using current equity
 
 ## Important endpoints
 
@@ -66,6 +67,7 @@ If port `8000` is already in use, add `--port 8001`.
 - `POST /bot/stop`
 - `POST /bot/halt`
 - `POST /bot/resume`
+- `POST /bot/reset-risk`
 - `GET /bot/status`
 - `GET /bot/log-summary`
 - `GET /metrics`
@@ -82,6 +84,7 @@ curl -X POST http://127.0.0.1:8000/bot/start
 curl -X POST http://127.0.0.1:8000/bot/status
 curl -X POST http://127.0.0.1:8000/bot/halt
 curl -X POST http://127.0.0.1:8000/bot/resume
+curl -X POST http://127.0.0.1:8000/bot/reset-risk
 curl http://127.0.0.1:8000/metrics
 curl http://127.0.0.1:8000/journal
 curl http://127.0.0.1:8000/performance
@@ -99,7 +102,11 @@ curl http://127.0.0.1:8000/performance
 
 ## Risk controls
 
-- Daily loss limit and daily order limit enforcement
+- Daily loss stop is calculated from the highest equity observed during the current trading day
+- Current drawdown is `max(0, day_peak_equity - current_equity)`
+- `max_intraday_drawdown_usd` tracks the worst peak-to-trough drawdown seen today
+- `MAX_DAILY_LOSS_USD` is latched for the remainder of the trading day once breached
+- `POST /bot/resume` does not clear a true daily loss stop; use `POST /bot/reset-risk` to recover
 - Per-symbol trade count limits
 - Portfolio and symbol exposure limits
 - Optional higher-timeframe confirmation

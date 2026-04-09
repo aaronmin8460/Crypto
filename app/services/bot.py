@@ -181,6 +181,16 @@ class TradingBot:
 
             equity = Decimal(str(account.get("equity", account.get("cash", "0"))))
             self.state.record_equity_change(equity)
+            if self.state.max_intraday_drawdown_usd >= self.settings.max_daily_loss_usd:
+                self.state.risk_stop_latched = True
+                self.state.halted_reason = "max daily loss exceeded"
+                logger.warning(
+                    "daily loss stop latched: current_drawdown=%.2f peak_equity=%.2f limit=%.2f",
+                    self.state.current_equity_drawdown_usd,
+                    self.state.day_peak_equity or 0.0,
+                    self.settings.max_daily_loss_usd,
+                )
+
             logger.info(
                 "scan start account equity=%s total_exposure=%.2f open_orders=%d",
                 equity,
@@ -459,8 +469,20 @@ class TradingBot:
         logger.warning("bot halted: %s", reason)
 
     async def resume(self) -> None:
+        if self.state.risk_stop_latched and self.state.halted_reason == "max daily loss exceeded":
+            logger.warning("resume requested but max daily loss stop remains latched; call /bot/reset-risk to clear")
+            return
         self.state.resume()
         logger.info("bot resumed")
+
+    async def reset_risk(self) -> None:
+        account = await self.trading_service.get_account()
+        equity = Decimal(str(account.get("equity", account.get("cash", "0"))))
+        self.state.reset_risk_state(float(equity))
+        if self.state.halted_reason == "max daily loss exceeded":
+            self.state.halted_reason = None
+        self.persistence.save_state(self.state)
+        logger.info("risk state reset using current equity %.2f", float(equity))
 
     def status(self) -> dict[str, Any]:
         return {
@@ -478,6 +500,10 @@ class TradingBot:
             "risk_profile": self.state.risk_profile,
             "daily_order_count": self.state.daily_order_count,
             "daily_equity_drawdown_usd": self.state.daily_equity_drawdown_usd,
+            "day_peak_equity": self.state.day_peak_equity,
+            "current_equity_drawdown_usd": self.state.current_equity_drawdown_usd,
+            "max_intraday_drawdown_usd": self.state.max_intraday_drawdown_usd,
+            "risk_stop_latched": self.state.risk_stop_latched,
             "total_portfolio_exposure_usd": self.state.total_portfolio_exposure_usd,
             "daily_symbol_trade_count": self.state.daily_symbol_trade_count,
             "last_signal_by_symbol": self.state.last_signal_by_symbol,

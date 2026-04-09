@@ -145,7 +145,23 @@ async def bot_halt(request: Request):
 async def bot_resume(request: Request):
     bot = _get_bot(request)
     await bot.resume()
-    return {"status": "resumed"}
+    return {
+        "status": "resumed",
+        "halted_reason": bot.state.halted_reason,
+        "risk_stop_latched": bot.state.risk_stop_latched,
+    }
+
+
+@router.post("/bot/reset-risk")
+async def bot_reset_risk(request: Request):
+    bot = _get_bot(request)
+    await bot.reset_risk()
+    return {
+        "status": "risk reset",
+        "halted_reason": bot.state.halted_reason,
+        "risk_stop_latched": bot.state.risk_stop_latched,
+        "day_peak_equity": bot.state.day_peak_equity,
+    }
 
 
 @router.get("/bot/status", response_model=BotStatusResponse)

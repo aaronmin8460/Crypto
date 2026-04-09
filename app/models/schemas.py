@@ -128,6 +128,10 @@ class BotStatusResponse(BaseModel):
     risk_profile: dict[str, float]
     daily_order_count: int
     daily_equity_drawdown_usd: float
+    day_peak_equity: float | None
+    current_equity_drawdown_usd: float
+    max_intraday_drawdown_usd: float
+    risk_stop_latched: bool
     total_portfolio_exposure_usd: float
     daily_symbol_trade_count: dict[str, int]
     last_signal_by_symbol: dict[str, str]

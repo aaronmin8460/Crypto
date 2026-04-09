@@ -20,13 +20,17 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Update `.env` with your Alpaca paper API credentials.
+Update `.env` with your own Alpaca paper API credentials. `.env.example` contains placeholder values only and does not include working keys.
+
+> If any Alpaca keys were ever committed publicly, rotate them immediately and replace them with new paper credentials.
 
 ## Run the API
 
 ```bash
 uvicorn main:app --reload
 ```
+
+If port `8000` is already in use, change the port with `--port 8001`. If your virtualenv is inside the project directory, reload can be noisy when the `.venv` folder changes. For cleaner reload behavior, keep the venv outside the project or use `uvicorn main:app --reload --reload-dir app --reload-dir main.py`.
 
 ## API endpoints
 

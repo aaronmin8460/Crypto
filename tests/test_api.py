@@ -80,3 +80,40 @@ def test_bot_log_summary_endpoint():
 
     assert response.status_code == 200
     assert response.json()["mode"] == "paper"
+
+
+def test_metrics_endpoint_returns_summary():
+    client = TestClient(app)
+    with patch.object(app.state.bot.persistence, "get_metrics", return_value={
+        "total_trades": 3,
+        "win_rate": 66.67,
+        "average_gain_loss": 12.5,
+        "cumulative_realized_pnl": 37.5,
+    }):
+        response = client.get("/metrics")
+
+    assert response.status_code == 200
+    assert response.json()["total_trades"] == 3
+
+
+def test_journal_endpoint_returns_entries():
+    client = TestClient(app)
+    entry = {
+        "id": 1,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "symbol": "BTC/USD",
+        "action": "BUY",
+        "reason": "test",
+        "entry_price": 100.0,
+        "exit_price": None,
+        "quantity": 1.0,
+        "notional": 100.0,
+        "realized_pnl": None,
+        "drawdown": 0.0,
+        "raw": {},
+    }
+    with patch.object(app.state.bot.persistence, "get_journal", return_value=[entry]):
+        response = client.get("/journal")
+
+    assert response.status_code == 200
+    assert response.json()["entries"][0]["symbol"] == "BTC/USD"

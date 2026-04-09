@@ -1,49 +1,175 @@
 from __future__ import annotations
 
 import pandas as pd
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
-class SignalResult(BaseModel):
+class StrategyResult(BaseModel):
     signal: str
     reason: str
+    filters: dict[str, bool] = Field(default_factory=dict)
+    indicators: dict[str, float] = Field(default_factory=dict)
+    blocked_by: list[str] = Field(default_factory=list)
 
 
-def evaluate_signal(df: pd.DataFrame) -> SignalResult:
+def _compute_rsi(close: pd.Series, length: int) -> pd.Series:
+    delta = close.diff()
+    gain = delta.where(delta > 0, 0.0)
+    loss = (-delta).where(delta < 0, 0.0)
+    avg_gain = gain.rolling(length).mean()
+    avg_loss = loss.rolling(length).mean()
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
+def _compute_atr(df: pd.DataFrame, length: int) -> pd.Series:
+    close = df["Close"].astype(float)
+    high = df.get("High", close).astype(float)
+    low = df.get("Low", close).astype(float)
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [high - low, (high - prev_close).abs(), (low - prev_close).abs()],
+        axis=1,
+    ).max(axis=1)
+    return tr.rolling(length).mean()
+
+
+def _signal_from_crossovers(df: pd.DataFrame, fast_len: int, slow_len: int) -> tuple[bool, bool]:
+    close = df["Close"].astype(float)
+    fast = close.rolling(fast_len).mean()
+    slow = close.rolling(slow_len).mean()
+    prev_fast = fast.shift(1)
+    prev_slow = slow.shift(1)
+    last_fast = fast.iloc[-1]
+    last_slow = slow.iloc[-1]
+    prior_fast = prev_fast.iloc[-1]
+    prior_slow = prev_slow.iloc[-1]
+    if pd.isna(prior_fast) or pd.isna(prior_slow) or pd.isna(last_fast) or pd.isna(last_slow):
+        raise ValueError("insufficient SMA data for strategy")
+    crossed_up = prior_fast <= prior_slow and last_fast > last_slow
+    crossed_down = prior_fast >= prior_slow and last_fast < last_slow
+    return crossed_up, crossed_down
+
+
+def _higher_timeframe_is_ok(higher_bars: pd.DataFrame, fast_len: int, slow_len: int) -> bool:
+    if higher_bars is None or len(higher_bars) < slow_len + 1:
+        return False
+    higher_close = higher_bars["Close"].astype(float)
+    fast = higher_close.rolling(fast_len).mean().iloc[-1]
+    slow = higher_close.rolling(slow_len).mean().iloc[-1]
+    return not pd.isna(fast) and not pd.isna(slow) and fast > slow
+
+
+def evaluate_signal(df: pd.DataFrame, settings: Any | None = None, higher_bars: pd.DataFrame | None = None) -> StrategyResult:
+    if settings is None:
+        class DefaultSettings:
+            strategy_fast_sma = 20
+            strategy_slow_sma = 50
+            rsi_length = 14
+            atr_length = 14
+            min_volume = 0.0
+            min_volatility_pct = 0.0
+            rsi_overbought = 70.0
+            higher_timeframe_confirmation = False
+
+        settings = DefaultSettings()
+
     df = df.sort_values("Date", ignore_index=True)
-    if len(df) < 51:
-        raise ValueError("not enough bars to compute SMA50")
+    minimum_bars = max(settings.strategy_slow_sma, settings.rsi_length, settings.atr_length) + 2
+    if len(df) < minimum_bars:
+        raise ValueError(f"not enough bars to compute strategy indicators (need {minimum_bars})")
 
     close = df["Close"].astype(float)
-    sma20 = close.rolling(20).mean()
-    sma50 = close.rolling(50).mean()
+    high = df.get("High", close).astype(float)
+    low = df.get("Low", close).astype(float)
+    volume = df.get("Volume", pd.Series([1.0] * len(df))).astype(float)
 
-    prev_index = len(df) - 2
-    last_index = len(df) - 1
+    crossed_up, crossed_down = _signal_from_crossovers(df, settings.strategy_fast_sma, settings.strategy_slow_sma)
+    last_close = float(close.iloc[-1])
+    last_high = float(high.iloc[-1])
+    last_low = float(low.iloc[-1])
+    average_volume = float(volume.rolling(20).mean().iloc[-1])
+    last_volume = float(volume.iloc[-1])
+    volatility_pct = float((last_high - last_low) / last_close if last_close else 0.0)
+    rsi = float(_compute_rsi(close, settings.rsi_length).iloc[-1])
+    atr = float(_compute_atr(df, settings.atr_length).iloc[-1])
 
-    prev_fast = sma20.iloc[prev_index]
-    prev_slow = sma50.iloc[prev_index]
-    last_fast = sma20.iloc[last_index]
-    last_slow = sma50.iloc[last_index]
-    last_close = close.iloc[last_index]
+    fast_sma = float(close.rolling(settings.strategy_fast_sma).mean().iloc[-1])
+    slow_sma = float(close.rolling(settings.strategy_slow_sma).mean().iloc[-1])
+    trend_ok = fast_sma > slow_sma
+    higher_trend_ok = True
+    if settings.higher_timeframe_confirmation:
+        higher_trend_ok = _higher_timeframe_is_ok(higher_bars, settings.strategy_fast_sma, settings.strategy_slow_sma)
 
-    if pd.isna(prev_fast) or pd.isna(prev_slow) or pd.isna(last_fast) or pd.isna(last_slow):
-        raise ValueError("insufficient valid SMA values")
+    extended_up = False
+    if len(close) >= 4:
+        extended_up = close.iloc[-4:-1].diff().dropna().gt(0).all()
+    overbought = rsi > settings.rsi_overbought and extended_up
 
-    crossed_up = prev_fast <= prev_slow and last_fast > last_slow
-    crossed_down = prev_fast >= prev_slow and last_fast < last_slow
-    close_below_slow = last_close < last_slow
+    filters = {
+        "trend": trend_ok,
+        "volume": last_volume >= max(settings.min_volume, average_volume * 0.5),
+        "volatility": volatility_pct >= settings.min_volatility_pct,
+        "rsi_not_overbought": not overbought,
+        "higher_timeframe": higher_trend_ok,
+    }
+    indicators = {
+        "fast_sma": fast_sma,
+        "slow_sma": slow_sma,
+        "rsi": rsi,
+        "atr": atr,
+        "volatility_pct": volatility_pct,
+        "volume": last_volume,
+        "average_volume": average_volume,
+    }
 
-    if crossed_up and last_close > last_slow:
-        return SignalResult(
+    blocked_by: list[str] = []
+    if crossed_up:
+        if not trend_ok:
+            blocked_by.append("trend")
+        if not filters["volume"]:
+            blocked_by.append("volume")
+        if not filters["volatility"]:
+            blocked_by.append("volatility")
+        if not filters["rsi_not_overbought"]:
+            blocked_by.append("overbought")
+        if settings.higher_timeframe_confirmation and not higher_trend_ok:
+            blocked_by.append("higher_timeframe")
+
+        if blocked_by:
+            reason_details = ", ".join(blocked_by)
+            return StrategyResult(
+                signal="HOLD",
+                reason=f"buy signal blocked by: {reason_details}",
+                filters=filters,
+                indicators=indicators,
+                blocked_by=blocked_by,
+            )
+
+        return StrategyResult(
             signal="BUY",
-            reason="fast SMA crossed above slow SMA and latest close is above slow SMA",
+            reason="sma crossover confirmed with trend, volume, and volatility filters",
+            filters=filters,
+            indicators=indicators,
+            blocked_by=[],
         )
 
-    if crossed_down or close_below_slow:
-        return SignalResult(
+    if crossed_down or last_close < slow_sma:
+        return StrategyResult(
             signal="SELL",
-            reason="fast SMA crossed below slow SMA or latest close dropped below slow SMA",
+            reason="price weakness detected by SMA crossover or close below slow SMA",
+            filters=filters,
+            indicators=indicators,
+            blocked_by=[],
         )
 
-    return SignalResult(signal="HOLD", reason="no valid crossover signal")
+    return StrategyResult(
+        signal="HOLD",
+        reason="no actionable signal",
+        filters=filters,
+        indicators=indicators,
+        blocked_by=[],
+    )
+
+
+SignalResult = StrategyResult

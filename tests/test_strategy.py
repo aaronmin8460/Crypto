@@ -33,3 +33,12 @@ def test_hold_signal():
     df = make_bars(values)
     result = evaluate_signal(df)
     assert result.signal == "HOLD"
+
+
+def test_overbought_extends_hold():
+    values = [100.0] * 40 + [110.0, 115.0, 120.0, 125.0, 130.0, 135.0, 140.0, 145.0, 150.0, 155.0, 160.0, 165.0, 170.0, 175.0, 180.0, 185.0, 190.0, 195.0, 200.0, 205.0]
+    df = make_bars(values)
+    result = evaluate_signal(df)
+    assert result.signal == "HOLD"
+    assert result.filters["rsi_not_overbought"] is False
+    assert result.indicators["rsi"] > 70

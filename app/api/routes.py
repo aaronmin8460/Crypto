@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 
 from app.models.schemas import (
     AccountResponse,
@@ -8,6 +8,9 @@ from app.models.schemas import (
     BotStatusResponse,
     ConfigResponse,
     HealthResponse,
+    JournalEntry,
+    JournalResponse,
+    MetricsResponse,
     OrderResponse,
     PositionResponse,
     RunOnceResponse,
@@ -56,17 +59,36 @@ async def config(request: Request):
         default_timeframe=settings.default_timeframe,
         scan_interval_seconds=settings.scan_interval_seconds,
         order_notional_usd=settings.order_notional_usd,
+        position_sizing_mode=settings.position_sizing_mode,
+        position_size_percent=settings.position_size_percent,
         max_open_positions=settings.max_open_positions,
+        cooldown_seconds_per_symbol=settings.cooldown_seconds_per_symbol,
+        post_exit_cooldown_seconds=settings.post_exit_cooldown_seconds,
+        max_trades_per_symbol_per_day=settings.max_trades_per_symbol_per_day,
+        bar_limit=settings.bar_limit,
         max_daily_orders=settings.max_daily_orders,
         max_daily_loss_usd=settings.max_daily_loss_usd,
         max_position_notional_usd=settings.max_position_notional_usd,
-        cooldown_seconds_per_symbol=settings.cooldown_seconds_per_symbol,
-        bar_limit=settings.bar_limit,
+        max_symbol_exposure_usd=settings.max_symbol_exposure_usd,
+        max_portfolio_exposure_usd=settings.max_portfolio_exposure_usd,
         require_healthy_account=settings.require_healthy_account,
         paper_trading=settings.paper_trading,
         trade_time_in_force=settings.trade_time_in_force,
         stop_loss_pct=settings.stop_loss_pct,
         take_profit_pct=settings.take_profit_pct,
+        stop_loss_mode=settings.stop_loss_mode,
+        atr_length=settings.atr_length,
+        atr_stop_multiplier=settings.atr_stop_multiplier,
+        enable_trailing_stop=settings.enable_trailing_stop,
+        strategy_fast_sma=settings.strategy_fast_sma,
+        strategy_slow_sma=settings.strategy_slow_sma,
+        rsi_length=settings.rsi_length,
+        rsi_oversold=settings.rsi_oversold,
+        rsi_overbought=settings.rsi_overbought,
+        min_volume=settings.min_volume,
+        min_volatility_pct=settings.min_volatility_pct,
+        higher_timeframe_confirmation=settings.higher_timeframe_confirmation,
+        higher_timeframe=settings.higher_timeframe,
     )
 
 
@@ -145,3 +167,24 @@ async def bot_log_summary(request: Request):
         last_run_time=status["last_run_time"],
         last_results=status["last_results"],
     )
+
+
+@router.get("/metrics", response_model=MetricsResponse)
+async def metrics(request: Request):
+    bot = _get_bot(request)
+    metrics = bot.persistence.get_metrics()
+    return MetricsResponse(**metrics)
+
+
+@router.get("/journal", response_model=JournalResponse)
+async def journal(request: Request, limit: int = Query(50, ge=1, le=200)):
+    bot = _get_bot(request)
+    entries = bot.persistence.get_journal(limit)
+    return JournalResponse(entries=[JournalEntry(**entry) for entry in entries])
+
+
+@router.get("/performance", response_model=MetricsResponse)
+async def performance(request: Request):
+    bot = _get_bot(request)
+    metrics = bot.persistence.get_metrics()
+    return MetricsResponse(**metrics)

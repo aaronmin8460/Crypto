@@ -80,7 +80,7 @@ def test_fetch_bars_eth_usd():
 
 
 def test_fetch_bars_v1beta3_endpoint():
-    """Test that the correct v1beta3 endpoint format is used."""
+    """Test that the correct v1beta3 endpoint format is used with start/end times."""
     settings = AppSettings(
         alpaca_api_key="test-key",
         alpaca_secret_key="test-secret",
@@ -116,3 +116,46 @@ def test_fetch_bars_v1beta3_endpoint():
     assert call_log[0]["params"]["symbols"] == "BTC/USD"
     assert call_log[0]["params"]["timeframe"] == "1H"
     assert call_log[0]["params"]["limit"] == 120
+    # Verify start and end are included
+    assert "start" in call_log[0]["params"]
+    assert "end" in call_log[0]["params"]
+    # Verify start is much earlier than end (200 hours for 1H bars)
+    from datetime import datetime
+    start = datetime.fromisoformat(call_log[0]["params"]["start"].replace("Z", "+00:00"))
+    end = datetime.fromisoformat(call_log[0]["params"]["end"].replace("Z", "+00:00"))
+    hours_diff = (end - start).total_seconds() / 3600
+    assert hours_diff >= 199, f"Expected >=199 hour lookback, got {hours_diff}"
+
+
+def test_fetch_bars_sufficient_for_sma50():
+    """Test that bars returned are sufficient for SMA50 computation (>=51 bars)."""
+    from datetime import datetime, timedelta, timezone
+    
+    settings = AppSettings(
+        alpaca_api_key="test-key",
+        alpaca_secret_key="test-secret",
+    )
+    service = AlpacaCryptoData(settings)
+    
+    # Create 60 bars (enough for SMA50)
+    bars = []
+    start_time = datetime(2025, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+    for i in range(60):
+        bar_time = start_time + timedelta(hours=i)
+        bars.append({
+            "t": bar_time.isoformat(),
+            "o": 30000 + i * 10,
+            "h": 30100 + i * 10,
+            "l": 29900 + i * 10,
+            "c": 30050 + i * 10,
+            "v": 100
+        })
+    
+    payload = {"bars": {"BTC/USD": bars}}
+
+    with patch("app.services.alpaca_crypto_data.httpx.AsyncClient", return_value=DummyClient(payload)):
+        df = asyncio.run(service.fetch_bars("BTC/USD", timeframe="1H", limit=120))
+
+    assert len(df) >= 51, "Should have at least 51 bars for SMA50"
+    assert isinstance(df, pd.DataFrame)
+    assert "Close" in df.columns

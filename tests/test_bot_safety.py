@@ -42,10 +42,9 @@ def test_no_order_submitted_when_trading_disabled():
     settings = AppSettings(broker_mode="paper", trading_enabled=False)
     bot = TradingBot(settings, AsyncMock(spec=AlpacaCryptoData), AsyncMock(spec=AlpacaTrading))
     bot.state.daily_order_date = date.today()
-    bot.state.last_cash = 1000.0
 
     bot.data_service.fetch_bars = AsyncMock(return_value=sample_bars_df())
-    bot.trading_service.get_account.return_value = {"cash": "1000", "status": "ACTIVE"}
+    bot.trading_service.get_account.return_value = {"cash": "1000", "equity": "1000", "status": "ACTIVE"}
     bot.trading_service.list_positions.return_value = []
     bot.trading_service.submit_market_buy_notional = AsyncMock()
 
@@ -60,11 +59,12 @@ def test_cooldown_enforcement_blocks_trade():
     settings = AppSettings(broker_mode="paper", trading_enabled=True)
     bot = TradingBot(settings, AsyncMock(spec=AlpacaCryptoData), AsyncMock(spec=AlpacaTrading))
     bot.state.daily_order_date = date.today()
-    bot.state.last_cash = 1000.0
     bot.state.cooldowns["BTC/USD"] = datetime.now(timezone.utc) + pd.Timedelta(seconds=600)
 
-    bot.trading_service.get_account.return_value = {"cash": "1000", "status": "ACTIVE"}
+    bot.data_service.fetch_bars = AsyncMock(return_value=sample_bars_df())
+    bot.trading_service.get_account.return_value = {"cash": "1000", "equity": "10000", "status": "ACTIVE"}
     bot.trading_service.list_positions.return_value = []
+    bot.trading_service.submit_market_buy_notional = AsyncMock(return_value={"filled_avg_price": "100.0"})
 
     with patch("app.services.bot.evaluate_signal", return_value=SignalResult(signal="BUY", reason="crossed up")):
         result = asyncio.run(bot.run_once())
@@ -77,9 +77,9 @@ def test_daily_order_limit_reached():
     bot = TradingBot(settings, AsyncMock(spec=AlpacaCryptoData), AsyncMock(spec=AlpacaTrading))
     bot.state.daily_order_date = date.today()
     bot.state.daily_order_count = 1
-    bot.state.last_cash = 1000.0
 
-    bot.trading_service.get_account.return_value = {"cash": "1000", "status": "ACTIVE"}
+    bot.data_service.fetch_bars = AsyncMock(return_value=sample_bars_df())
+    bot.trading_service.get_account.return_value = {"cash": "1000", "equity": "1000", "status": "ACTIVE"}
     bot.trading_service.list_positions.return_value = []
 
     with patch("app.services.bot.evaluate_signal", return_value=SignalResult(signal="BUY", reason="crossed up")):
@@ -92,11 +92,13 @@ def test_max_daily_loss_halts_trading():
     settings = AppSettings(broker_mode="paper", trading_enabled=True, max_daily_loss_usd=150)
     bot = TradingBot(settings, AsyncMock(spec=AlpacaCryptoData), AsyncMock(spec=AlpacaTrading))
     bot.state.daily_order_date = date.today()
-    bot.state.daily_realized_pnl = -151.0
-    bot.state.last_cash = 1000.0
+    bot.state.last_equity = 10151.0  # Set starting equity so drawdown will be 151
+    bot.state.daily_equity_drawdown_usd = 0.0
 
-    bot.trading_service.get_account.return_value = {"cash": "1000", "status": "ACTIVE"}
+    bot.data_service.fetch_bars = AsyncMock(return_value=sample_bars_df())
+    bot.trading_service.get_account.return_value = {"cash": "1000", "equity": "10000", "status": "ACTIVE"}
     bot.trading_service.list_positions.return_value = []
+    bot.trading_service.submit_market_buy_notional = AsyncMock(return_value={"filled_avg_price": "100.0"})
 
     with patch("app.services.bot.evaluate_signal", return_value=SignalResult(signal="BUY", reason="crossed up")):
         result = asyncio.run(bot.run_once())

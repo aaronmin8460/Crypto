@@ -72,7 +72,7 @@ def test_bot_log_summary_endpoint():
         "cooldowns": {},
         "risk_profile": {},
         "daily_order_count": 0,
-        "daily_realized_pnl": 0.0,
+        "daily_equity_drawdown_usd": 0.0,
         "last_signal_by_symbol": {},
         "last_order_by_symbol": {},
     }):

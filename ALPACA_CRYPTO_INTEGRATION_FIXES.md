@@ -3,22 +3,29 @@
 ## Problems Fixed
 
 ### Problem 1: 404 Endpoint Not Found (FIXED ✅)
+
 The app was returning 404 errors when fetching crypto market data:
+
 - Error: `crypto bars request failed: 404 {"message":"endpoint not found."}`
 - Root cause: Using deprecated Alpaca v2 endpoint `/v2/crypto/{symbol}/bars`
 
 ### Problem 2: Insufficient Bars for SMA50 (FIXED ✅)
+
 Strategy was failing with: `signal error: not enough bars to compute SMA50`
+
 - Root cause: Historical bars request lacked explicit start time, so Alpaca defaulted to current day only
 - Example: 1H bars from today might return only 10-15 bars instead of 120 requested
 
 ## Solutions Implemented
 
 ### Solution 1: Updated to Alpaca v1beta3 Endpoint
+
 Now using: `/v1beta3/crypto/us/bars` with symbols as query parameter
 
 ### Solution 2: Added Explicit Historical Lookback Window
+
 Request parameters now include:
+
 - **start**: ISO timestamp 200 hours in the past (for 1H bars)
 - **end**: Current time (ISO format)
 - Lookback calculation: 1H=200hrs, 1D=6000hrs, other timeframes=limit×1.5
@@ -28,11 +35,13 @@ Request parameters now include:
 #### 1. **app/services/alpaca_crypto_data.py** (UPDATED)
 
 **Endpoint Updates**:
+
 - **Old endpoint**: `GET /v2/crypto/{symbol}/bars` (symbol in path, URL-encoded)
 - **New endpoint**: `GET /v1beta3/crypto/us/bars` (symbols as query parameter)
 - **Response format**: `{"bars": {"BTC/USD": [...], "ETH/USD": [...]}}`
 
 **Lookback Window (NEW)**:
+
 ```python
 # For 1H timeframe: request 200 hours of history
 start_time = now - timedelta(hours=200)
@@ -47,10 +56,12 @@ params = {
 ```
 
 **Added Logging**:
+
 - Warns if fewer than 51 bars returned (insufficient for SMA50)
 - Logs: received bars count, timeframe, limit, start/end times
 
 **Changes Summary**:
+
 - ✅ Import logging module
 - ✅ Added datetime/timedelta/timezone imports
 - ✅ Calculate start/end times based on timeframe and limit
@@ -62,6 +73,7 @@ params = {
 #### 2. **tests/test_data_service.py** (UPDATED)
 
 **Test Updates**:
+
 - Updated `test_fetch_bars_normalizes_data` - v1beta3 format (dict with symbols)
 - Updated `test_fetch_bars_eth_usd` - ETH/USD support verification
 - Updated `test_fetch_bars_v1beta3_endpoint` - NOW VERIFIES:
@@ -71,11 +83,13 @@ params = {
   - **NEW**: Verifies lookback window is >=199 hours for 1H bars
 
 **New Test Added**:
+
 - `test_fetch_bars_sufficient_for_sma50` - Verifies 60-bar dataframe processes correctly for SMA50
 
 #### 3. **.env Configuration** (NO CHANGES NEEDED)
 
 Already configured correctly:
+
 ```env
 ALPACA_DATA_BASE_URL=https://data.alpaca.markets
 DEFAULT_SYMBOLS=["BTC/USD","ETH/USD"]
@@ -89,6 +103,7 @@ TRADING_ENABLED=true
 ✅ **All 23 tests passing** (was 22, added 1 SMA50 test)
 
 **Test Breakdown**:
+
 - Data service: 4 tests (3 endpoint + 1 SMA50)
 - Bot safety: 7 tests
 - API endpoints: 5 tests
@@ -101,6 +116,7 @@ TRADING_ENABLED=true
 ✅ **Problem 1 Fixed**: `/run-once` no longer returns 404 errors  
 ✅ **Problem 2 Fixed**: Strategy receives sufficient bars (>=51) for SMA50 computation  
 ✅ **Details**:
+
 1. Alpaca v1beta3 endpoint used with symbols as query parameter
 2. Explicit start time (200 hours back for 1H bars) prevents default behavior
 3. BTC/USD and ETH/USD both fetch full historical bars
@@ -124,7 +140,7 @@ TRADING_ENABLED=true
 
 - **.env** - Already configured correctly
 - **app/config/settings.py** - Settings model unchanged
-- **app/services/bot.py** - Bot logic unchanged  
+- **app/services/bot.py** - Bot logic unchanged
 - **app/services/strategy.py** - Strategy logic unchanged
 - **app/api/routes.py** - API routes unchanged
 - **Trading safety logic** - Still enforced (paper mode, daily limits, cooldowns, etc.)
@@ -132,12 +148,14 @@ TRADING_ENABLED=true
 ## Verification Steps (COMPLETED)
 
 ✅ All 23 tests passing:
+
 ```bash
 pytest -q
 # Result: 23 passed, 2 warnings in 2.66s
 ```
 
 ✅ App imports successfully:
+
 ```bash
 python -c "from main import app; from app.config.settings import AppSettings; ..."
 # Result: App loads without errors, paper trading enabled
@@ -146,6 +164,7 @@ python -c "from main import app; from app.config.settings import AppSettings; ..
 ## Request Format Example
 
 **What API now requests to Alpaca**:
+
 ```
 GET https://data.alpaca.markets/v1beta3/crypto/us/bars?
   symbols=BTC/USD&
@@ -156,6 +175,7 @@ GET https://data.alpaca.markets/v1beta3/crypto/us/bars?
 ```
 
 **Response from Alpaca (v1beta3 format)**:
+
 ```json
 {
   "bars": {
@@ -170,6 +190,7 @@ GET https://data.alpaca.markets/v1beta3/crypto/us/bars?
 ```
 
 **Processed Dataframe** (normalized):
+
 ```
        Date    Open   High    Low   Close  Volume
 0  2026-04-07 18:00:00  62000  62500  61800  62200     150
@@ -194,3 +215,4 @@ uvicorn main:app --reload
 curl -X POST http://127.0.0.1:8000/run-once | jq
 
 # Expected output: strategy signals (BUY/SELL/HOLD) instead of "signal error" messages
+```

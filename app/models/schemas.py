@@ -10,6 +10,36 @@ class HealthResponse(BaseModel):
     status: str = "ok"
 
 
+class UsageResponse(BaseModel):
+    app_name: str = "Alpaca Crypto Trading Bot"
+    mode: str  # paper or live
+    trading_enabled: bool
+    endpoints: dict[str, str] = {
+        "GET /": "This help message",
+        "GET /health": "Health check",
+        "GET /config": "Configuration details",
+        "GET /account": "Account info from Alpaca",
+        "GET /positions": "Current positions",
+        "GET /orders": "Recent orders",
+        "POST /run-once": "Run one scan and execute",
+        "POST /bot/start": "Start background loop",
+        "POST /bot/stop": "Stop background loop",
+        "POST /bot/halt": "Emergency halt trading",
+        "POST /bot/resume": "Resume after halt",
+        "GET /bot/status": "Bot status",
+        "GET /bot/log-summary": "Summary of latest run",
+        "GET /docs": "Interactive API documentation (Swagger)",
+    }
+    notices: list[str] = [
+        "⚠️  /run-once requires HTTP POST (not GET)",
+        "📝 Browser address bar sends GET and will return 405 Method Not Allowed",
+        "🔧 Use `curl -X POST http://localhost:8000/run-once` to test",
+        "📖 Visit GET /docs for interactive API testing",
+        "🛡️  Paper trading is the default; live trading must be explicitly enabled",
+        "🚨 See GET /config for all safety limits and settings",
+    ]
+
+
 class ConfigResponse(BaseModel):
     app_env: str
     broker_mode: str
@@ -69,7 +99,7 @@ class BotStatusResponse(BaseModel):
     cooldowns: dict[str, datetime]
     risk_profile: dict[str, float]
     daily_order_count: int
-    daily_realized_pnl: float
+    daily_equity_drawdown_usd: float
     last_signal_by_symbol: dict[str, str]
     last_order_by_symbol: dict[str, dict[str, Any]]
 
@@ -79,6 +109,6 @@ class BotLogSummaryResponse(BaseModel):
     mode: str
     halted_reason: str | None
     daily_order_count: int
-    daily_realized_pnl: float
+    daily_equity_drawdown_usd: float
     last_run_time: datetime | None
     last_results: dict[str, Any]

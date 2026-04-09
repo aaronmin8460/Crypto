@@ -11,6 +11,7 @@ from app.models.schemas import (
     OrderResponse,
     PositionResponse,
     RunOnceResponse,
+    UsageResponse,
 )
 
 router = APIRouter()
@@ -26,6 +27,16 @@ def _get_settings(request: Request):
 
 def _get_trading(request: Request):
     return request.app.state.trading_service
+
+
+@router.get("/", response_model=UsageResponse)
+async def root(request: Request):
+    """Return API usage guidance."""
+    settings = _get_settings(request)
+    return UsageResponse(
+        mode=settings.broker_mode,
+        trading_enabled=settings.trading_enabled,
+    )
 
 
 @router.get("/health", response_model=HealthResponse)
@@ -130,7 +141,7 @@ async def bot_log_summary(request: Request):
         mode=status["mode"],
         halted_reason=status["halted_reason"],
         daily_order_count=status["daily_order_count"],
-        daily_realized_pnl=status["daily_realized_pnl"],
+        daily_equity_drawdown_usd=status["daily_equity_drawdown_usd"],
         last_run_time=status["last_run_time"],
         last_results=status["last_results"],
     )

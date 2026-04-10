@@ -51,8 +51,19 @@ class ConfigResponse(BaseModel):
     trading_enabled: bool
     allow_live_trading: bool
     default_symbols: list[str]
+    enable_dynamic_universe: bool
+    universe_refresh_seconds: int
+    universe_quote_currency: str
+    universe_excluded_symbols: list[str]
+    universe_max_symbols: int
+    universe_require_tradable: bool
+    universe_persist_cache: bool
     default_timeframe: str
     scan_interval_seconds: int
+    max_symbols_per_scan: int
+    top_candidates_per_scan: int
+    bar_batch_size: int
+    bar_batch_max_retries: int
     order_notional_usd: float
     position_sizing_mode: str
     position_size_percent: float
@@ -81,7 +92,16 @@ class ConfigResponse(BaseModel):
     rsi_oversold: float
     rsi_overbought: float
     min_volume: float
+    min_average_volume: float
     min_volatility_pct: float
+    min_price: float
+    exclude_cooldown_symbols_from_prefilter: bool
+    exclude_existing_positions_from_prefilter: bool
+    exclude_open_order_symbols_from_prefilter: bool
+    rank_by_trend_weight: float
+    rank_by_volume_weight: float
+    rank_by_volatility_weight: float
+    rank_by_momentum_weight: float
     higher_timeframe_confirmation: bool
     higher_timeframe: str
 
@@ -103,6 +123,9 @@ class SymbolResult(BaseModel):
     signal: str
     reason: str
     order: dict[str, Any] | None = None
+    rank_score: float | None = None
+    ranking_reasons: list[str] = Field(default_factory=list)
+    prefilter: dict[str, Any] = Field(default_factory=dict)
     filters: dict[str, bool] = Field(default_factory=dict)
     indicators: dict[str, float] = Field(default_factory=dict)
     blocked_by: list[str] = Field(default_factory=list)
@@ -151,6 +174,15 @@ class BotStatusResponse(BaseModel):
     confirmed_open_orders: int
     confirmed_positions: int
     untrusted_local_orders_discarded: int
+    dynamic_universe_enabled: bool = False
+    universe_symbol_count: int = 0
+    eligible_symbol_count: int = 0
+    filtered_symbol_count: int = 0
+    top_candidates: list[dict[str, Any]] = Field(default_factory=list)
+    scan_duration_ms: int | None = None
+    symbols_evaluated_this_run: int = 0
+    symbols_skipped_by_prefilter: int = 0
+    last_scan_summary: dict[str, Any] = Field(default_factory=dict)
 
 
 class BotLogSummaryResponse(BaseModel):

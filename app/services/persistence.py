@@ -73,6 +73,15 @@ class Persistence:
             )
             """
         )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS universe_cache (
+                cache_key TEXT PRIMARY KEY,
+                payload TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
         self._conn.commit()
 
     def _to_json(self, value: Any) -> str:
@@ -98,6 +107,30 @@ class Persistence:
         cursor.execute(
             "INSERT INTO bot_state (id, payload) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload",
             (payload,),
+        )
+        self._conn.commit()
+
+    def load_universe_snapshot(self, cache_key: str = "default") -> dict[str, Any]:
+        cursor = self._conn.cursor()
+        cursor.execute(
+            "SELECT payload FROM universe_cache WHERE cache_key = ?",
+            (cache_key,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return {}
+        return self._from_json(row["payload"])
+
+    def save_universe_snapshot(self, payload: dict[str, Any], cache_key: str = "default") -> None:
+        cursor = self._conn.cursor()
+        cursor.execute(
+            "INSERT INTO universe_cache (cache_key, payload, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(cache_key) DO UPDATE SET payload=excluded.payload, updated_at=excluded.updated_at",
+            (
+                cache_key,
+                self._to_json(payload),
+                datetime.now().isoformat(),
+            ),
         )
         self._conn.commit()
 

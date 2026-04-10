@@ -11,9 +11,12 @@ import pandas as pd
 from app.config.settings import AppSettings
 from app.services.alpaca_crypto_data import AlpacaCryptoData
 from app.services.alpaca_trading import AlpacaTrading
+from app.services.crypto_universe import CryptoUniverseService
+from app.services.market_scanner import MarketScanner, ScanPlan
 from app.services.persistence import Persistence
 from app.services.state import BotState
 from app.services.strategy import evaluate_signal
+from app.utils.symbols import normalize_symbol
 
 logger = logging.getLogger(__name__)
 
@@ -38,11 +41,23 @@ class TradingBot:
         data_service: AlpacaCryptoData,
         trading_service: AlpacaTrading,
         persistence: Persistence | None = None,
+        universe_service: CryptoUniverseService | None = None,
+        market_scanner: MarketScanner | None = None,
     ) -> None:
         self.settings = settings
         self.data_service = data_service
         self.trading_service = trading_service
         self.persistence = persistence or Persistence(settings)
+        self.universe_service = universe_service or CryptoUniverseService(
+            settings,
+            trading_service,
+            persistence=self.persistence,
+        )
+        self.market_scanner = market_scanner or MarketScanner(
+            settings,
+            data_service,
+            self.universe_service,
+        )
         self.state = BotState(mode=settings.broker_mode, trading_enabled=settings.trading_enabled)
         self._task: asyncio.Task | None = None
         self._lock = asyncio.Lock()
@@ -59,6 +74,7 @@ class TradingBot:
         self.state.running = False
         self.state.mode = self.settings.broker_mode
         self.state.trading_enabled = self.settings.trading_enabled
+        self.state.dynamic_universe_enabled = self.settings.enable_dynamic_universe
         self.state.reset_daily()
         await self.reconcile_broker_state(trigger="startup")
         self.persistence.save_state(self.state)
@@ -140,6 +156,80 @@ class TradingBot:
 
         return self.settings.order_notional_usd
 
+    def _build_symbol_result(
+        self,
+        symbol: str,
+        *,
+        rank_score: float | None = None,
+        ranking_reasons: list[str] | None = None,
+        prefilter: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "symbol": symbol,
+            "signal": "HOLD",
+            "reason": "pending",
+            "order": None,
+            "rank_score": rank_score,
+            "ranking_reasons": ranking_reasons or [],
+            "prefilter": prefilter or {},
+            "filters": {},
+            "indicators": {},
+            "blocked_by": [],
+            "submission_attempted": False,
+            "broker_order_accepted": False,
+            "broker_order_id": None,
+            "broker_order_status": None,
+            "cooldown_applied": False,
+        }
+
+    def _update_scan_state(self, scan_plan: ScanPlan) -> None:
+        self.state.dynamic_universe_enabled = self.settings.enable_dynamic_universe
+        self.state.universe_symbol_count = len(scan_plan.universe_symbols)
+        self.state.eligible_symbol_count = len(scan_plan.market_data_symbols)
+        self.state.filtered_symbol_count = len(scan_plan.ranked_candidates)
+        self.state.top_candidates = [candidate.to_summary() for candidate in scan_plan.top_candidates]
+        self.state.scan_duration_ms = scan_plan.scan_duration_ms
+        self.state.symbols_evaluated_this_run = len(scan_plan.evaluation_symbols)
+        self.state.symbols_skipped_by_prefilter = max(
+            0,
+            len(scan_plan.prefilter_results) - len(scan_plan.ranked_candidates),
+        )
+        self.state.last_scan_summary = scan_plan.summary
+
+    def _build_blocked_scan_results(
+        self,
+        scan_plan: ScanPlan,
+        reason: str,
+        blocked_by: str,
+    ) -> list[dict[str, Any]]:
+        ranked_by_symbol = {candidate.symbol: candidate for candidate in scan_plan.ranked_candidates}
+        results: list[dict[str, Any]] = []
+        fallback_symbols = scan_plan.evaluation_symbols or scan_plan.universe_symbols
+        for symbol in fallback_symbols:
+            ranked = ranked_by_symbol.get(symbol)
+            result = self._build_symbol_result(
+                symbol,
+                rank_score=ranked.score if ranked else None,
+                ranking_reasons=ranked.ranking_reasons if ranked else [],
+                prefilter=scan_plan.prefilter_results.get(symbol).to_dict()
+                if scan_plan.prefilter_results.get(symbol) is not None
+                else {},
+            )
+            result["reason"] = reason
+            result["blocked_by"].append(blocked_by)
+            results.append(result)
+        return results
+
+    def _symbol_exposure_usd(
+        self,
+        symbol: str,
+        position_map: dict[str, dict[str, Any]],
+    ) -> float:
+        position = position_map.get(symbol)
+        if position is None:
+            return 0.0
+        return abs(float(position.get("market_value", 0) or 0))
+
     async def run_once(self) -> dict[str, Any]:
         async with self._lock:
             run_time = datetime.now(timezone.utc)
@@ -156,25 +246,45 @@ class TradingBot:
                 open_orders_by_symbol = dict(self.state.open_orders)
             else:
                 account = await self.trading_service.get_account()
-                positions = await self.trading_service.list_positions()
+                raw_positions = await self.trading_service.list_positions()
+                positions = []
+                for position in raw_positions:
+                    normalized_symbol = normalize_symbol(
+                        position.get("symbol"),
+                        quote_currency=self.settings.universe_quote_currency,
+                    )
+                    if normalized_symbol is None:
+                        continue
+                    normalized_position = dict(position)
+                    normalized_position["symbol"] = normalized_symbol
+                    positions.append(normalized_position)
                 try:
                     open_orders = await self.trading_service.list_orders(status="open")
                 except Exception as exc:
                     logger.warning("Unable to fetch open orders: %s", exc)
                     open_orders = []
-                open_orders_by_symbol = {
-                    order.get("symbol", ""): order for order in open_orders if order.get("symbol")
-                }
+                open_orders_by_symbol = {}
+                for order in open_orders:
+                    normalized_order = self._normalize_broker_order(
+                        order,
+                        confirmation_path=BROKER_LIST_ORDERS_PATH,
+                    )
+                    if normalized_order is None or not self._is_open_order(normalized_order):
+                        continue
+                    open_orders_by_symbol[normalized_order["symbol"]] = normalized_order
                 self.state.open_orders = open_orders_by_symbol
                 self.state.confirmed_open_orders = len(open_orders_by_symbol)
-                self.state.confirmed_positions = len(
-                    [position for position in positions if position.get("symbol")]
-                )
+                self.state.confirmed_positions = len(positions)
                 self.state.total_portfolio_exposure_usd = sum(
                     abs(float(position.get("market_value", 0))) for position in positions
                 )
 
             position_map = {position["symbol"]: position for position in positions if position.get("symbol")}
+            cooldown_symbols = {
+                symbol
+                for symbol, available_at in self.state.cooldowns.items()
+                if available_at is not None and run_time < available_at
+            }
 
             equity = Decimal(str(account.get("equity", account.get("cash", "0"))))
             self.state.record_equity_change(equity)
@@ -195,20 +305,44 @@ class TradingBot:
                 len(open_orders_by_symbol),
             )
 
-            results: list[dict[str, Any]] = []
+            scan_plan = await self.market_scanner.build_scan_plan(
+                position_symbols=set(position_map),
+                open_order_symbols=set(open_orders_by_symbol),
+                cooldown_symbols=cooldown_symbols,
+            )
+            self._update_scan_state(scan_plan)
+
+            bars_by_symbol = dict(scan_plan.bars_by_symbol)
+            missing_symbols = [
+                symbol for symbol in scan_plan.evaluation_symbols if symbol not in bars_by_symbol
+            ]
+            if missing_symbols:
+                fetched_bars = await self.data_service.fetch_bars_for_symbols(
+                    missing_symbols,
+                    timeframe=self.settings.default_timeframe,
+                    limit=self.settings.bar_limit,
+                )
+                if isinstance(fetched_bars, dict):
+                    bars_by_symbol.update(fetched_bars)
+
+            higher_bars_by_symbol: dict[str, Any] = {}
+            if self.settings.higher_timeframe_confirmation and scan_plan.evaluation_symbols:
+                fetched_higher_bars = await self.data_service.fetch_bars_for_symbols(
+                    scan_plan.evaluation_symbols,
+                    timeframe=self.settings.higher_timeframe,
+                    limit=self.settings.bar_limit,
+                )
+                if isinstance(fetched_higher_bars, dict):
+                    higher_bars_by_symbol = fetched_higher_bars
 
             if self.state.halted_reason:
                 reason = f"trading halted: {self.state.halted_reason}"
                 logger.warning(reason)
-                for symbol in self.settings.default_symbols:
-                    results.append(
-                        {
-                            "symbol": symbol,
-                            "signal": "HOLD",
-                            "reason": reason,
-                            "order": None,
-                        }
-                    )
+                results = self._build_blocked_scan_results(
+                    scan_plan,
+                    reason=reason,
+                    blocked_by="halted",
+                )
                 response = self._build_response(run_time, results, account, positions)
                 self.persistence.save_state(self.state)
                 return response
@@ -216,6 +350,11 @@ class TradingBot:
             if self.settings.require_healthy_account and account.get("status") != "ACTIVE":
                 self.state.halted_reason = "account not healthy"
                 logger.warning("halting bot because account status is not ACTIVE: %s", account.get("status"))
+                results = self._build_blocked_scan_results(
+                    scan_plan,
+                    reason="account not healthy",
+                    blocked_by="account_health",
+                )
                 response = self._build_response(run_time, results, account, positions)
                 self.persistence.save_state(self.state)
                 return response
@@ -225,52 +364,56 @@ class TradingBot:
             ):
                 self.state.halted_reason = "live trading credentials missing"
                 logger.warning("halting live trading because API credentials are missing")
+                results = self._build_blocked_scan_results(
+                    scan_plan,
+                    reason="live trading credentials missing",
+                    blocked_by="credentials",
+                )
                 response = self._build_response(run_time, results, account, positions)
                 self.persistence.save_state(self.state)
                 return response
 
-            for symbol in self.settings.default_symbols:
-                symbol_result: dict[str, Any] = {
-                    "symbol": symbol,
-                    "signal": "HOLD",
-                    "reason": "pending",
-                    "order": None,
-                    "filters": {},
-                    "indicators": {},
-                    "blocked_by": [],
-                    "submission_attempted": False,
-                    "broker_order_accepted": False,
-                    "broker_order_id": None,
-                    "broker_order_status": None,
-                    "cooldown_applied": False,
-                }
+            ranked_by_symbol = {
+                candidate.symbol: candidate for candidate in scan_plan.ranked_candidates
+            }
+            results: list[dict[str, Any]] = []
+            for symbol in scan_plan.evaluation_symbols:
+                ranked_candidate = ranked_by_symbol.get(symbol)
+                prefilter_result = scan_plan.prefilter_results.get(symbol)
+                symbol_result = self._build_symbol_result(
+                    symbol,
+                    rank_score=ranked_candidate.score if ranked_candidate else None,
+                    ranking_reasons=ranked_candidate.ranking_reasons if ranked_candidate else [],
+                    prefilter=prefilter_result.to_dict() if prefilter_result is not None else {},
+                )
 
-                if not self.state.can_trade(symbol):
+                held_position = position_map.get(symbol)
+                if held_position is None and not self.state.can_trade(symbol):
                     symbol_result["reason"] = "cooldown active"
                     symbol_result["blocked_by"].append("cooldown")
                     results.append(symbol_result)
                     continue
 
-                held_position = position_map.get(symbol)
                 if symbol in open_orders_by_symbol:
                     symbol_result["reason"] = "open order pending"
                     symbol_result["blocked_by"].append("open_order")
                     results.append(symbol_result)
                     continue
 
-                bars, fetch_error = await self._fetch_bars_with_retry(
-                    symbol, self.settings.default_timeframe, self.settings.bar_limit
-                )
+                bars = bars_by_symbol.get(symbol)
+                fetch_error = ""
+                if bars is None:
+                    bars, fetch_error = await self._fetch_bars_with_retry(
+                        symbol, self.settings.default_timeframe, self.settings.bar_limit
+                    )
+                if bars is not None:
+                    bars_by_symbol[symbol] = bars
                 if bars is None:
                     symbol_result["reason"] = fetch_error
                     results.append(symbol_result)
                     continue
 
-                higher_bars = None
-                if self.settings.higher_timeframe_confirmation:
-                    higher_bars, _ = await self._fetch_bars_with_retry(
-                        symbol, self.settings.higher_timeframe, self.settings.bar_limit
-                    )
+                higher_bars = higher_bars_by_symbol.get(symbol)
 
                 try:
                     signal = evaluate_signal(bars, self.settings, higher_bars=higher_bars)
@@ -279,6 +422,25 @@ class TradingBot:
                     symbol_result["blocked_by"].append("signal_error")
                     results.append(symbol_result)
                     continue
+
+                if held_position is not None:
+                    risk_exit = self.state.can_exit_by_risk(
+                        symbol,
+                        float(bars.iloc[-1]["Close"]),
+                        self.settings.stop_loss_pct,
+                        self.settings.take_profit_pct,
+                        stop_loss_mode=self.settings.stop_loss_mode,
+                        atr_value=signal.indicators.get("atr"),
+                        atr_multiplier=self.settings.atr_stop_multiplier,
+                    )
+                    if risk_exit is not None and signal.signal != "SELL":
+                        signal = signal.model_copy(
+                            update={
+                                "signal": "SELL",
+                                "reason": f"{risk_exit.replace('_', ' ')} triggered by risk controls",
+                                "blocked_by": [],
+                            }
+                        )
 
                 symbol_result["signal"] = signal.signal
                 symbol_result["reason"] = signal.reason
@@ -318,6 +480,9 @@ class TradingBot:
                     ):
                         symbol_result["reason"] = "portfolio exposure limit reached"
                         symbol_result["blocked_by"].append("portfolio_exposure")
+                    elif len(position_map) >= self.settings.max_open_positions:
+                        symbol_result["reason"] = "max open positions reached"
+                        symbol_result["blocked_by"].append("max_open_positions")
                     else:
                         notional = self._calculate_order_notional(equity, bars)
                         if notional <= 0:
@@ -332,6 +497,12 @@ class TradingBot:
                         ):
                             symbol_result["reason"] = "would exceed portfolio exposure limit"
                             symbol_result["blocked_by"].append("portfolio_exposure")
+                        elif (
+                            self._symbol_exposure_usd(symbol, position_map) + notional
+                            > self.settings.max_symbol_exposure_usd
+                        ):
+                            symbol_result["reason"] = "would exceed symbol exposure limit"
+                            symbol_result["blocked_by"].append("symbol_exposure")
                         else:
                             try:
                                 order = await self.trading_service.submit_market_buy_notional(
@@ -623,10 +794,19 @@ class TradingBot:
             confirmed_orders.append(normalized_order)
 
         confirmed_orders.sort(key=self._order_sort_key, reverse=True)
-        confirmed_positions = [position for position in positions if position.get("symbol")]
-        broker_positions = {
-            position["symbol"]: position for position in confirmed_positions if position.get("symbol")
-        }
+        confirmed_positions: list[dict[str, Any]] = []
+        broker_positions: dict[str, dict[str, Any]] = {}
+        for position in positions:
+            normalized_symbol = normalize_symbol(
+                position.get("symbol"),
+                quote_currency=self.settings.universe_quote_currency,
+            )
+            if normalized_symbol is None:
+                continue
+            normalized_position = dict(position)
+            normalized_position["symbol"] = normalized_symbol
+            confirmed_positions.append(normalized_position)
+            broker_positions[normalized_symbol] = normalized_position
 
         last_order_by_symbol: dict[str, dict[str, Any]] = {}
         open_orders_by_symbol: dict[str, dict[str, Any]] = {}
@@ -822,7 +1002,10 @@ class TradingBot:
             return None
 
         order_id = order.get("id")
-        symbol = order.get("symbol")
+        symbol = normalize_symbol(
+            order.get("symbol"),
+            quote_currency=self.settings.universe_quote_currency,
+        )
         side = order.get("side")
         status = order.get("status")
         submitted_at = self._parse_timestamp(order.get("submitted_at"))
@@ -842,6 +1025,7 @@ class TradingBot:
             return None
 
         normalized_order = dict(order)
+        normalized_order["symbol"] = symbol
         normalized_order["submitted_at"] = self._format_timestamp(submitted_at)
         normalized_order["source"] = "broker"
         normalized_order["confirmation_path"] = confirmation_path
@@ -946,7 +1130,10 @@ class TradingBot:
         positions: list[dict[str, Any]],
     ) -> dict[str, Any]:
         self.state.last_run_time = run_time
-        self.state.last_results = {"symbols": results}
+        self.state.last_results = {
+            "symbols": results,
+            "scan_summary": self.state.last_scan_summary,
+        }
         return {
             "run_time": run_time,
             "results": results,
@@ -1051,4 +1238,13 @@ class TradingBot:
             "confirmed_open_orders": self.state.confirmed_open_orders,
             "confirmed_positions": self.state.confirmed_positions,
             "untrusted_local_orders_discarded": self.state.untrusted_local_orders_discarded,
+            "dynamic_universe_enabled": self.state.dynamic_universe_enabled,
+            "universe_symbol_count": self.state.universe_symbol_count,
+            "eligible_symbol_count": self.state.eligible_symbol_count,
+            "filtered_symbol_count": self.state.filtered_symbol_count,
+            "top_candidates": self.state.top_candidates,
+            "scan_duration_ms": self.state.scan_duration_ms,
+            "symbols_evaluated_this_run": self.state.symbols_evaluated_this_run,
+            "symbols_skipped_by_prefilter": self.state.symbols_skipped_by_prefilter,
+            "last_scan_summary": self.state.last_scan_summary,
         }

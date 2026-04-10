@@ -72,3 +72,15 @@ def test_live_broker_mode_requires_allow_live_trading():
     assert settings.trading_allowed is False
     assert settings.alpaca_base_url == "https://api.alpaca.markets"
     assert settings.paper_trading is False
+
+
+def test_dynamic_universe_settings_are_normalized():
+    settings = AppSettings(
+        enable_dynamic_universe=True,
+        default_symbols=["btcusd", "ETH-USD", "BTC/USD"],
+        universe_excluded_symbols=["solusd", "ETH/USD"],
+    )
+
+    assert settings.enable_dynamic_universe is True
+    assert settings.default_symbols == ["BTC/USD", "ETH/USD"]
+    assert settings.universe_excluded_symbols == ["SOL/USD", "ETH/USD"]

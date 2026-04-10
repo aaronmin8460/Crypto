@@ -135,11 +135,72 @@ def test_bot_status_returns_risk_fields():
             "confirmed_open_orders": 0,
             "confirmed_positions": 0,
             "untrusted_local_orders_discarded": 0,
+            "dynamic_universe_enabled": True,
+            "universe_symbol_count": 25,
+            "eligible_symbol_count": 20,
+            "filtered_symbol_count": 8,
+            "top_candidates": [{"symbol": "SOL/USD", "rank_score": 1.0, "ranking_reasons": ["momentum"]}],
+            "scan_duration_ms": 32,
+            "symbols_evaluated_this_run": 3,
+            "symbols_skipped_by_prefilter": 12,
+            "last_scan_summary": {"mode": "dynamic"},
         }):
             response = client.get("/bot/status")
 
     assert response.status_code == 200
     assert response.json()["day_peak_equity"] == 100000.0
+    assert response.json()["dynamic_universe_enabled"] is True
+
+
+def test_bot_status_returns_scanner_fields():
+    client = TestClient(app)
+    with patch.object(app.state.bot, "has_suspicious_state", return_value=False):
+        with patch.object(app.state.bot, "status", return_value={
+            "running": False,
+            "mode": "paper",
+            "trading_enabled": False,
+            "halted_reason": None,
+            "last_run_time": None,
+            "last_loop_time": None,
+            "last_error": None,
+            "consecutive_failures": 0,
+            "last_results": {},
+            "cooldowns": {},
+            "open_orders": {},
+            "risk_profile": {},
+            "daily_order_count": 0,
+            "daily_equity_drawdown_usd": 0.0,
+            "day_peak_equity": None,
+            "current_equity_drawdown_usd": 0.0,
+            "max_intraday_drawdown_usd": 0.0,
+            "risk_stop_latched": False,
+            "total_portfolio_exposure_usd": 0.0,
+            "daily_symbol_trade_count": {},
+            "last_signal_by_symbol": {},
+            "last_order_by_symbol": {},
+            "local_order_attempts_by_symbol": {},
+            "state_last_reconciled_at": None,
+            "broker_state_consistent": True,
+            "stale_state_detected": False,
+            "stale_state_cleared_count": 0,
+            "confirmed_open_orders": 0,
+            "confirmed_positions": 0,
+            "untrusted_local_orders_discarded": 0,
+            "dynamic_universe_enabled": True,
+            "universe_symbol_count": 40,
+            "eligible_symbol_count": 40,
+            "filtered_symbol_count": 12,
+            "top_candidates": [{"symbol": "ETH/USD", "rank_score": 0.91, "ranking_reasons": ["trend"]}],
+            "scan_duration_ms": 55,
+            "symbols_evaluated_this_run": 4,
+            "symbols_skipped_by_prefilter": 28,
+            "last_scan_summary": {"mode": "dynamic", "top_candidates": ["ETH/USD"]},
+        }):
+            response = client.get("/bot/status")
+
+    assert response.status_code == 200
+    assert response.json()["universe_symbol_count"] == 40
+    assert response.json()["top_candidates"][0]["symbol"] == "ETH/USD"
 
 
 def test_metrics_endpoint_returns_summary():

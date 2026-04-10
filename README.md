@@ -1,30 +1,164 @@
 # Alpaca Crypto Trading Bot
 
-A Python FastAPI application for Alpaca crypto trading. This repo now includes a more resilient paper trading service with persistence, richer signal reasoning, risk controls, metrics, and journaling.
+FastAPI-based Alpaca crypto bot with paper-trading safety, broker-backed reconciliation, SQLite persistence, and a market-wide crypto scanner that can rank the full Alpaca-supported USD crypto universe before trading.
 
 ## What it does
 
-- Loads trading configuration from `.env`
-- Defaults to **paper trading** mode
+- Defaults to **paper trading**
 - Requires explicit opt-in for live trading
-- Persists bot state in a local SQLite file
-- Tracks last run time, cooldowns, entry prices, orders, positions, and drawdown
-- Treats broker truth as the source of truth for positions, orders, cooldowns, and daily trade counts
-- Reconciles broker state on startup to avoid duplicate orders after restart
-- Uses SMA trend logic enhanced with volume, volatility, and RSI filters
-- Supports configurable sizing via fixed notional, percent equity, or ATR-adjusted sizing
-- Enforces per-symbol and portfolio exposure limits
-- Exposes metrics, journal, and performance endpoints
+- Preserves broker truth as the source of truth for orders, positions, cooldowns, and trade counts
+- Supports both:
+  - `static` mode with `DEFAULT_SYMBOLS`
+  - `dynamic` mode with a cached Alpaca crypto universe scanner
+- Filters and ranks symbols before full strategy evaluation
+- Evaluates only a manageable shortlist each cycle
+- Keeps cooldowns, daily limits, max open positions, symbol exposure, and portfolio exposure enforced
+- Persists bot state, journal entries, positions, orders, and the cached universe in SQLite
 
-## Key features
+## Scanner modes
 
-- Background bot start/stop with a clean lifecycle
-- Last loop heartbeat and consecutive failure tracking
-- Persistence via `bot_state.db`
-- Broker reconciliation on startup
-- Strategy decision payloads with filters and indicator metadata
-- Trade journal persisted to SQLite
-- Metrics and performance summary endpoints
+### Static mode
+
+- Set `ENABLE_DYNAMIC_UNIVERSE=false`
+- The bot uses `DEFAULT_SYMBOLS`
+- This keeps the old fixed-symbol behavior for manual/debug workflows
+
+### Dynamic universe mode
+
+- Set `ENABLE_DYNAMIC_UNIVERSE=true`
+- The bot discovers active Alpaca crypto assets, normalizes them to `BASE/USD`, caches the universe, and refreshes it periodically
+- `DEFAULT_SYMBOLS` are only used as a fallback if universe discovery returns nothing
+
+## How the dynamic universe is built
+
+The universe service:
+
+- pulls Alpaca crypto assets from `/v2/assets`
+- keeps only active symbols
+- requires tradable assets by default
+- restricts to the configured quote currency, `USD` by default
+- normalizes symbols to a canonical format such as `BTC/USD`
+- removes malformed and duplicate symbols
+- applies `UNIVERSE_EXCLUDED_SYMBOLS`
+- caches the result in memory and persists the latest snapshot in SQLite
+
+Key settings:
+
+- `ENABLE_DYNAMIC_UNIVERSE`
+- `UNIVERSE_REFRESH_SECONDS`
+- `UNIVERSE_QUOTE_CURRENCY`
+- `UNIVERSE_EXCLUDED_SYMBOLS`
+- `UNIVERSE_MAX_SYMBOLS`
+- `UNIVERSE_REQUIRE_TRADABLE`
+- `UNIVERSE_PERSIST_CACHE`
+
+## Scanner pipeline
+
+Each scan runs in stages:
+
+### Stage A: universe load
+
+- Load all eligible symbols from the cached Alpaca universe
+
+### Stage B: prefilter
+
+Symbols can be rejected before strategy evaluation for:
+
+- insufficient history
+- minimum average volume
+- minimum volatility
+- minimum price
+- exclusion list
+- cooldown exclusion
+- existing-position exclusion
+- open-order exclusion
+
+### Stage C: ranking
+
+Remaining symbols are ranked with weighted factors:
+
+- trend strength
+- volume
+- volatility
+- momentum
+
+The momentum/trend score also incorporates RSI quality and distance from moving averages so the shortlist favors cleaner setups instead of just raw volatility.
+
+### Stage D: final candidates
+
+- Only the top `TOP_CANDIDATES_PER_SCAN` symbols go into full strategy evaluation for new entries
+- Existing positions and open-order symbols are still carried into final evaluation so exits and broker consistency are not skipped
+
+## Market data behavior
+
+- Uses Alpaca multi-symbol crypto bar requests when possible
+- Chunks large universes with `BAR_BATCH_SIZE`
+- Retries failed batches with `BAR_BATCH_MAX_RETRIES`
+- Handles partial batch responses safely
+- Logs batch size, requested symbols, returned symbols, retries, and failures
+
+## Strategy and trade execution
+
+The existing strategy remains in place:
+
+- SMA crossover signal logic
+- volume and volatility filters
+- RSI filter
+- optional higher timeframe confirmation
+- fixed notional, percent equity, or ATR-based sizing
+
+The scanner only changes **which symbols reach the strategy**, not the broker reconciliation model.
+
+Per evaluated symbol, the bot now exposes:
+
+- `symbol`
+- `rank_score`
+- `ranking_reasons`
+- `prefilter`
+- `filters`
+- `indicators`
+- `signal`
+- `blocked_by`
+- `submission_attempted`
+- `broker_order_accepted`
+- `broker_order_id`
+- `broker_order_status`
+
+## Risk and reconciliation
+
+Risk controls remain enforced across the wider universe:
+
+- `MAX_OPEN_POSITIONS`
+- `MAX_PORTFOLIO_EXPOSURE_USD`
+- `MAX_SYMBOL_EXPOSURE_USD`
+- `MAX_TRADES_PER_SYMBOL_PER_DAY`
+- per-symbol cooldowns
+- daily drawdown stop
+
+When several symbols qualify, the bot processes the best-ranked entry candidates first. Existing positions are evaluated ahead of new entries so sells and risk exits are not starved by a large universe.
+
+Broker truth still wins:
+
+- startup reconciliation rebuilds state from Alpaca
+- post-submit reconciliation confirms broker-accepted orders
+- stale or fake local orders are discarded
+- `/bot/reconcile-state` rebuilds internal state from broker truth on demand
+
+## Status visibility
+
+`GET /bot/status` now includes scanner metadata such as:
+
+- `dynamic_universe_enabled`
+- `universe_symbol_count`
+- `eligible_symbol_count`
+- `filtered_symbol_count`
+- `top_candidates`
+- `scan_duration_ms`
+- `symbols_evaluated_this_run`
+- `symbols_skipped_by_prefilter`
+- `last_scan_summary`
+
+Use `last_scan_summary.prefilter_results` and `top_candidates` to understand why symbols were shortlisted or skipped.
 
 ## Setup
 
@@ -35,7 +169,7 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Update `.env` with your Alpaca credentials and any additional runtime settings.
+Then update `.env` with your Alpaca credentials and runtime settings.
 
 > If any Alpaca keys were ever committed publicly, rotate them immediately.
 
@@ -44,18 +178,6 @@ Update `.env` with your Alpaca credentials and any additional runtime settings.
 ```bash
 uvicorn main:app --reload --reload-exclude .venv
 ```
-
-If port `8000` is already in use, add `--port 8001`.
-
-## Operation modes
-
-- `POST /run-once` runs one trading cycle immediately
-- `POST /bot/start` launches the continuous background loop
-- `POST /bot/stop` stops the background loop cleanly
-- `POST /bot/halt` pauses trading with an emergency reason
-- `POST /bot/resume` clears a manual halt state
-- `POST /bot/reset-risk` clears a daily loss stop and recomputes risk using current equity
-- `POST /bot/reconcile-state` rebuilds internal bot state from broker truth
 
 ## Important endpoints
 
@@ -77,121 +199,137 @@ If port `8000` is already in use, add `--port 8001`.
 - `GET /journal`
 - `GET /performance`
 
-## Example curl commands
+## Example `.env` for dynamic market scanning
 
-```bash
-curl http://127.0.0.1:8000/health
-curl http://127.0.0.1:8000/config
-curl -X POST http://127.0.0.1:8000/run-once
-curl -X POST http://127.0.0.1:8000/bot/start
-curl http://127.0.0.1:8000/bot/status
-curl -X POST http://127.0.0.1:8000/bot/halt
-curl -X POST http://127.0.0.1:8000/bot/resume
-curl -X POST http://127.0.0.1:8000/bot/reset-risk
-curl -X POST http://127.0.0.1:8000/bot/reconcile-state
-curl http://127.0.0.1:8000/metrics
-curl http://127.0.0.1:8000/journal
-curl http://127.0.0.1:8000/performance
+```env
+APP_ENV=development
+BROKER_MODE=paper
+TRADING_ENABLED=true
+ALLOW_LIVE_TRADING=false
+
+ALPACA_API_KEY=your-key
+ALPACA_SECRET_KEY=your-secret
+ALPACA_BASE_URL=https://paper-api.alpaca.markets
+ALPACA_DATA_BASE_URL=https://data.alpaca.markets
+
+ENABLE_DYNAMIC_UNIVERSE=true
+UNIVERSE_REFRESH_SECONDS=3600
+UNIVERSE_QUOTE_CURRENCY=USD
+UNIVERSE_EXCLUDED_SYMBOLS=["UST/USD"]
+UNIVERSE_MAX_SYMBOLS=0
+UNIVERSE_REQUIRE_TRADABLE=true
+UNIVERSE_PERSIST_CACHE=true
+
+DEFAULT_SYMBOLS=["BTC/USD","ETH/USD"]
+SCAN_INTERVAL_SECONDS=60
+DEFAULT_TIMEFRAME=1H
+BAR_LIMIT=120
+BAR_BATCH_SIZE=50
+BAR_BATCH_MAX_RETRIES=2
+
+MAX_SYMBOLS_PER_SCAN=0
+TOP_CANDIDATES_PER_SCAN=8
+MIN_AVERAGE_VOLUME=1000
+MIN_VOLATILITY_PCT=0.01
+MIN_PRICE=1
+EXCLUDE_COOLDOWN_SYMBOLS_FROM_PREFILTER=true
+EXCLUDE_EXISTING_POSITIONS_FROM_PREFILTER=true
+EXCLUDE_OPEN_ORDER_SYMBOLS_FROM_PREFILTER=true
+
+RANK_BY_TREND_WEIGHT=0.35
+RANK_BY_VOLUME_WEIGHT=0.20
+RANK_BY_VOLATILITY_WEIGHT=0.20
+RANK_BY_MOMENTUM_WEIGHT=0.25
+
+POSITION_SIZING_MODE=fixed_notional
+ORDER_NOTIONAL_USD=100
+MAX_OPEN_POSITIONS=2
+MAX_POSITION_NOTIONAL_USD=250
+MAX_SYMBOL_EXPOSURE_USD=300
+MAX_PORTFOLIO_EXPOSURE_USD=500
+MAX_TRADES_PER_SYMBOL_PER_DAY=2
+COOLDOWN_SECONDS_PER_SYMBOL=900
+POST_EXIT_COOLDOWN_SECONDS=900
+MAX_DAILY_ORDERS=10
+MAX_DAILY_LOSS_USD=150
+
+STRATEGY_FAST_SMA=20
+STRATEGY_SLOW_SMA=50
+RSI_LENGTH=14
+RSI_OVERBOUGHT=70
+MIN_VOLUME=0
+HIGHER_TIMEFRAME_CONFIRMATION=false
+HIGHER_TIMEFRAME=4H
 ```
 
-## Persistence and storage
+## Tuning guide
 
-- Bot state is stored in `bot_state.db`
-- The SQLite persistence layer saves:
-  - bot state and run metadata
-  - open orders and broker positions
-  - recent orders
-  - trade journal entries
-- On restart, the bot reconciles Alpaca account, recent orders, and positions before using persisted trading state.
-- Placeholder or stale local paper-testing state that is not confirmed by the broker is purged during reconciliation.
+### Tune the universe size
 
-## Risk controls
+- Lower `UNIVERSE_MAX_SYMBOLS` or `MAX_SYMBOLS_PER_SCAN` for smaller, faster scans
+- Raise `TOP_CANDIDATES_PER_SCAN` if the shortlist is too narrow
 
-- Daily loss stop is calculated from the highest equity observed during the current trading day
-- Current drawdown is `max(0, day_peak_equity - current_equity)`
-- `max_intraday_drawdown_usd` tracks the worst peak-to-trough drawdown seen today
-- `MAX_DAILY_LOSS_USD` is latched for the remainder of the trading day once breached
-- `POST /bot/resume` does not clear a true daily loss stop; use `POST /bot/reset-risk` to recover
-- `POST /bot/reset-risk` resets drawdown and risk latch state, then refreshes broker-backed state so bogus order memory does not linger
-- Per-symbol trade count limits
-- Portfolio and symbol exposure limits
-- Optional higher-timeframe confirmation
-- RSI-based overbought filtering
-- ATR-based sizing and stop functionality
+### Tune prefilters
 
-## Broker truth and reconciliation
+- Raise `MIN_AVERAGE_VOLUME` to avoid thin symbols
+- Raise `MIN_VOLATILITY_PCT` to avoid dead markets
+- Raise `MIN_PRICE` if you want to skip very low-priced assets
+- Use `UNIVERSE_EXCLUDED_SYMBOLS` for permanent removals
 
-- **Signal generated**: Strategy indicates BUY or SELL
-- **Submission attempted**: Order payload sent to Alpaca
-- **Broker response validated**: Alpaca returns a realistic order record with `id`, `symbol`, `side`, `status`, and `submitted_at`
-- **Broker confirmed**: A follow-up broker reconciliation sees the order in Alpaca `list_orders`
-- **Filled**: Order reaches `filled` status (may happen later)
-- **Position confirmed**: Broker positions reflect the trade
-- Broker truth wins over internal memory. Reconciliation rebuilds:
-  - confirmed open orders
-  - confirmed positions
-  - `last_order_by_symbol`
-  - `daily_order_count`
-  - `daily_symbol_trade_count`
-  - cooldowns
-  - entry prices
-- Fake or stale local orders such as placeholder IDs like `12345` are discarded automatically.
-- Broker state is reconciled at startup, before trading decisions, after validated submission attempts, on `POST /bot/reconcile-state`, and when `/bot/status` detects structurally suspicious local order state.
-- Unconfirmed local submit responses are kept separate from broker-confirmed state under `local_order_attempts_by_symbol`.
+### Tune ranking
 
-## `reset-risk` vs `reconcile-state`
+- Increase `RANK_BY_TREND_WEIGHT` for stronger trend bias
+- Increase `RANK_BY_VOLUME_WEIGHT` for liquidity bias
+- Increase `RANK_BY_VOLATILITY_WEIGHT` to favor faster movers
+- Increase `RANK_BY_MOMENTUM_WEIGHT` to favor stronger recent acceleration
 
-- `POST /bot/reset-risk` clears the daily loss latch and re-anchors risk tracking to current equity. It is for recovering from a risk halt.
-- `POST /bot/reconcile-state` does not reset risk history. It pulls fresh broker truth and purges stale local order, cooldown, counter, and entry-price state.
-- Use `POST /bot/reconcile-state` first when `/bot/status` disagrees with `/orders`, `/positions`, or `/account`.
+## Debugging skipped symbols
 
-## Strategy configuration
+If a symbol is not traded:
 
-New configurable settings include:
+- check `/bot/status`
+- inspect `last_scan_summary.prefilter_results`
+- inspect `top_candidates`
+- inspect `POST /run-once` results for `blocked_by`, `filters`, and `indicators`
 
-- `POSITION_SIZING_MODE`
-- `POSITION_SIZE_PERCENT`
-- `MAX_SYMBOL_EXPOSURE_USD`
-- `MAX_PORTFOLIO_EXPOSURE_USD`
-- `MAX_TRADES_PER_SYMBOL_PER_DAY`
-- `POST_EXIT_COOLDOWN_SECONDS`
-- `STOP_LOSS_MODE`
-- `ATR_LENGTH`
-- `ATR_STOP_MULTIPLIER`
-- `ENABLE_TRAILING_STOP`
-- `STRATEGY_FAST_SMA`
-- `STRATEGY_SLOW_SMA`
-- `RSI_LENGTH`
-- `RSI_OVERSOLD`
-- `RSI_OVERBOUGHT`
-- `MIN_VOLUME`
-- `MIN_VOLATILITY_PCT`
-- `HIGHER_TIMEFRAME_CONFIRMATION`
-- `HIGHER_TIMEFRAME`
+Common causes:
 
-## Common failure modes and fixes
+- filtered out during prefilter
+- not ranked into the top N
+- cooldown active
+- open order pending
+- already holding the symbol
+- daily trade limit reached
+- exposure or open-position limits reached
+- trading disabled or account halted
 
-- If the bot reports `account not healthy`, confirm your Alpaca account status and `REQUIRE_HEALTHY_ACCOUNT` configuration.
-- If trading is disabled, verify `TRADING_ENABLED=true` and that paper mode is configured as expected.
-- If `/bot/status` shows stale order metadata but `/orders` and `/positions` are empty, call `POST /bot/reconcile-state` and check:
-  - `broker_state_consistent`
-  - `stale_state_detected`
-  - `stale_state_cleared_count`
-  - `confirmed_open_orders`
-  - `confirmed_positions`
-  - `untrusted_local_orders_discarded`
-- If the bot does not place orders after restart, check the `open_orders` state and broker reconciliation logs.
-- Debug mismatches by comparing `/bot/status`, `/orders`, `/positions`, and `/account`. After a successful reconciliation they should be logically consistent.
-- For strategy tuning, inspect the `filters` and `indicators` fields in `POST /run-once` responses.
+## Persistence
 
-## Changelog
+SQLite state in `bot_state.db` stores:
 
-- Added SQLite persistence for bot state, orders, positions, and journal entries
-- Added startup broker reconciliation and restore behavior
-- Added continuous `/bot/start` and `/bot/stop` support with clean lifecycle
-- Added heartbeat fields and failure tracking to `/bot/status`
-- Added `/metrics`, `/journal`, and `/performance` endpoints
-- Added richer strategy reasoning with filters, indicators, and blocked reasons
-- Added configurable sizing modes and exposure limits
-- Added journal persistence and performance metrics
-- Added tests for persistence, reconciliation, duplicate order prevention, and new API endpoints
+- bot state
+- positions
+- orders
+- journal entries
+- cached universe snapshot
+
+## Tests
+
+Run the full suite with:
+
+```bash
+./.venv/bin/python -m pytest -q
+```
+
+Current coverage includes:
+
+- universe discovery and normalization
+- invalid/non-tradable exclusion
+- batched bar fetching and partial responses
+- prefilter and ranking behavior
+- top-N candidate selection
+- static vs dynamic mode switching
+- global risk enforcement under many-symbol scans
+- duplicate symbol avoidance
+- scanner status payloads
+- broker reconciliation after dynamic-mode trading

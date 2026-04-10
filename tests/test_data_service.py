@@ -159,3 +159,89 @@ def test_fetch_bars_sufficient_for_sma50():
     assert len(df) >= 51, "Should have at least 51 bars for SMA50"
     assert isinstance(df, pd.DataFrame)
     assert "Close" in df.columns
+
+
+def test_fetch_bars_for_symbols_batches_requests():
+    settings = AppSettings(
+        alpaca_api_key="test-key",
+        alpaca_secret_key="test-secret",
+        bar_batch_size=2,
+    )
+    service = AlpacaCryptoData(settings)
+    call_log = []
+
+    class TrackingClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, url, params=None):
+            symbols = params["symbols"].split(",")
+            call_log.append(symbols)
+            payload = {
+                "bars": {
+                    symbol: [
+                        {
+                            "t": "2025-01-01T00:00:00Z",
+                            "o": 100,
+                            "h": 101,
+                            "l": 99,
+                            "c": 100.5,
+                            "v": 10,
+                        }
+                    ]
+                    for symbol in symbols
+                }
+            }
+            return DummyResponse(payload)
+
+    with patch("app.services.alpaca_crypto_data.httpx.AsyncClient", return_value=TrackingClient()):
+        frames = asyncio.run(
+            service.fetch_bars_for_symbols(["BTC/USD", "ETH/USD", "BTCUSD", "SOL/USD"], timeframe="1H", limit=1)
+        )
+
+    assert len(call_log) == 2
+    assert call_log[0] == ["BTC/USD", "ETH/USD"]
+    assert call_log[1] == ["SOL/USD"]
+    assert sorted(frames) == ["BTC/USD", "ETH/USD", "SOL/USD"]
+
+
+def test_fetch_bars_for_symbols_handles_partial_batch_responses():
+    settings = AppSettings(
+        alpaca_api_key="test-key",
+        alpaca_secret_key="test-secret",
+        bar_batch_size=5,
+    )
+    service = AlpacaCryptoData(settings)
+
+    class PartialClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, url, params=None):
+            return DummyResponse(
+                {
+                    "bars": {
+                        "BTC/USD": [
+                            {
+                                "t": "2025-01-01T00:00:00Z",
+                                "o": 100,
+                                "h": 101,
+                                "l": 99,
+                                "c": 100.5,
+                                "v": 10,
+                            }
+                        ]
+                    }
+                }
+            )
+
+    with patch("app.services.alpaca_crypto_data.httpx.AsyncClient", return_value=PartialClient()):
+        frames = asyncio.run(service.fetch_bars_for_symbols(["BTC/USD", "ETH/USD"], timeframe="1H", limit=1))
+
+    assert sorted(frames) == ["BTC/USD"]

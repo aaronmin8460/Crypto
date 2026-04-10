@@ -42,6 +42,15 @@ class BotState(BaseModel):
     confirmed_open_orders: int = 0
     confirmed_positions: int = 0
     untrusted_local_orders_discarded: int = 0
+    dynamic_universe_enabled: bool = False
+    universe_symbol_count: int = 0
+    eligible_symbol_count: int = 0
+    filtered_symbol_count: int = 0
+    top_candidates: list[dict[str, Any]] = Field(default_factory=list)
+    scan_duration_ms: int | None = None
+    symbols_evaluated_this_run: int = 0
+    symbols_skipped_by_prefilter: int = 0
+    last_scan_summary: dict[str, Any] = Field(default_factory=dict)
 
     def can_trade(self, symbol: str) -> bool:
         if self.halted_reason:

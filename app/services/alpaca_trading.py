@@ -19,7 +19,11 @@ class AlpacaTrading:
         }
 
     async def _request(self, method: str, path: str, params: dict | None = None, json: dict | None = None) -> dict | list:
-        if self.settings.is_live_mode and not self.settings.allow_live_trading:
+        if (
+            method.upper() not in {"GET", "HEAD", "OPTIONS"}
+            and self.settings.is_live_mode
+            and not self.settings.allow_live_trading
+        ):
             raise RuntimeError("live trading is disabled by configuration")
 
         url = f"{self.settings.alpaca_base_url}{path}"
@@ -47,6 +51,10 @@ class AlpacaTrading:
     async def list_orders(self, status: str = "all", limit: int = 50) -> list[dict]:
         params = {"status": status, "limit": limit}
         return await self._request("GET", "/v2/orders", params=params)
+
+    async def list_assets(self, status: str = "active", asset_class: str = "crypto") -> list[dict]:
+        params = {"status": status, "asset_class": asset_class}
+        return await self._request("GET", "/v2/assets", params=params)
 
     async def submit_market_buy_notional(self, symbol: str, notional: float) -> dict:
         payload = {

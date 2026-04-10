@@ -104,6 +104,11 @@ class SymbolResult(BaseModel):
     filters: dict[str, bool] = Field(default_factory=dict)
     indicators: dict[str, float] = Field(default_factory=dict)
     blocked_by: list[str] = Field(default_factory=list)
+    submission_attempted: bool = False
+    broker_order_accepted: bool = False
+    broker_order_id: str | None = None
+    broker_order_status: str | None = None
+    cooldown_applied: bool = False
 
 
 class RunOnceResponse(BaseModel):

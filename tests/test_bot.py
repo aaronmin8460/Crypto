@@ -20,11 +20,20 @@ def test_bot_run_once_places_buy_and_cools_down():
     trading_service = AsyncMock()
     trading_service.get_account.return_value = {"cash": "200", "status": "ACTIVE"}
     trading_service.list_positions.return_value = []
-    trading_service.submit_market_buy_notional.return_value = {"id": "order123"}
+    trading_service.list_orders.return_value = []
+    trading_service.submit_market_buy_notional.return_value = {
+        "id": "order123",
+        "symbol": "BTC/USD",
+        "side": "buy",
+        "status": "accepted",
+        "submitted_at": "2023-01-01T00:00:00Z",
+        "filled_avg_price": "200.0",
+    }
 
     bot = TradingBot(settings, data_service, trading_service)
     bot.data_service.fetch_bars = AsyncMock()
     bot.data_service.fetch_bars.return_value = AsyncMock()
+    bot._extract_filled_price = lambda order, fallback: 200.0
 
     async def fake_fetch(*args, **kwargs):
         import pandas as pd

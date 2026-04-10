@@ -113,6 +113,18 @@ curl http://127.0.0.1:8000/performance
 - RSI-based overbought filtering
 - ATR-based sizing and stop functionality
 
+## Order execution and broker consistency
+
+- **Signal generated**: Strategy indicates BUY or SELL
+- **Submission attempted**: Order payload sent to Alpaca
+- **Broker accepted**: Alpaca returns valid order with `id`, `symbol`, `side`, `status`, `submitted_at`
+- **Filled**: Order reaches `filled` status (may happen later)
+- **Position confirmed**: Broker positions reflect the trade
+- Only broker-accepted orders update internal state (cooldowns, counts, entry prices)
+- Broker state is reconciled after every trade attempt and at startup
+- Broker truth wins over internal memory; fake responses do not create state changes
+- Debug divergences by comparing `/bot/status`, `/orders`, `/positions`, and `/account`
+
 ## Strategy configuration
 
 New configurable settings include:

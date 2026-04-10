@@ -241,6 +241,11 @@ class TradingBot:
                     "filters": {},
                     "indicators": {},
                     "blocked_by": [],
+                    "submission_attempted": False,
+                    "broker_order_accepted": False,
+                    "broker_order_id": None,
+                    "broker_order_status": None,
+                    "cooldown_applied": False,
                 }
 
                 if not self.state.can_trade(symbol):
@@ -328,29 +333,44 @@ class TradingBot:
                         else:
                             try:
                                 order = await self.trading_service.submit_market_buy_notional(symbol, notional)
-                                symbol_result["order"] = order
-                                symbol_result["reason"] = "buy order submitted"
-                                entry_price = self._extract_filled_price(order, float(bars.iloc[-1]["Close"]))
-                                self.state.record_entry_price(symbol, entry_price)
-                                self.state.record_trade(symbol, self.settings.cooldown_seconds_per_symbol)
-                                self.state.record_order(symbol, order)
-                                self.persistence.save_order(symbol, order, "BUY", symbol_result["reason"])
-                                self.persistence.save_journal_entry(
-                                    symbol=symbol,
-                                    action="BUY",
-                                    reason=symbol_result["reason"],
-                                    entry_price=entry_price,
-                                    exit_price=None,
-                                    quantity=float(order.get("filled_qty", 0)) or None,
-                                    notional=float(order.get("notional", notional)) if order.get("notional") is not None else notional,
-                                    realized_pnl=None,
-                                    drawdown=self.state.daily_equity_drawdown_usd,
-                                    raw=order,
-                                )
-                                logger.info("submitted buy order for %s at %.2f: %s", symbol, entry_price, order)
+                                if not self._validate_order_response(order, symbol, "buy"):
+                                    symbol_result["reason"] = "broker order validation failed"
+                                    symbol_result["blocked_by"].append("broker_validation")
+                                    symbol_result["submission_attempted"] = True
+                                    symbol_result["broker_order_accepted"] = False
+                                    logger.warning("broker order validation failed for %s: %s", symbol, order)
+                                else:
+                                    await self._reconcile_broker_state()
+                                    symbol_result["order"] = order
+                                    symbol_result["reason"] = "buy order accepted by broker"
+                                    symbol_result["submission_attempted"] = True
+                                    symbol_result["broker_order_accepted"] = True
+                                    symbol_result["broker_order_id"] = order.get("id")
+                                    symbol_result["broker_order_status"] = order.get("status")
+                                    entry_price = self._extract_filled_price(order, float(bars.iloc[-1]["Close"]))
+                                    self.state.record_entry_price(symbol, entry_price)
+                                    self.state.record_trade(symbol, self.settings.cooldown_seconds_per_symbol)
+                                    self.state.record_order(symbol, order)
+                                    self.persistence.save_order(symbol, order, "BUY", symbol_result["reason"])
+                                    self.persistence.save_journal_entry(
+                                        symbol=symbol,
+                                        action="BUY",
+                                        reason=symbol_result["reason"],
+                                        entry_price=entry_price,
+                                        exit_price=None,
+                                        quantity=float(order.get("filled_qty", 0)) or None,
+                                        notional=float(order.get("notional", notional)) if order.get("notional") is not None else notional,
+                                        realized_pnl=None,
+                                        drawdown=self.state.daily_equity_drawdown_usd,
+                                        raw=order,
+                                    )
+                                    symbol_result["cooldown_applied"] = True
+                                    logger.info("submitted buy order for %s at %.2f: %s", symbol, entry_price, order)
                             except Exception as exc:
                                 symbol_result["reason"] = f"buy error: {exc}"
                                 symbol_result["blocked_by"].append("execution_error")
+                                symbol_result["submission_attempted"] = True
+                                symbol_result["broker_order_accepted"] = False
                                 logger.warning("buy error for %s: %s", symbol, exc)
 
                 elif signal.signal == "SELL":
@@ -368,33 +388,48 @@ class TradingBot:
                         else:
                             try:
                                 order = await self.trading_service.submit_market_sell_qty(symbol, qty)
-                                symbol_result["order"] = order
-                                symbol_result["reason"] = "sell order submitted"
-                                exit_price = self._extract_filled_price(order, float(held_position.get("current_price", 0)))
-                                entry_price = self.state.position_entry_price.get(symbol)
-                                realized = None
-                                if entry_price is not None:
-                                    realized = (exit_price - entry_price) * qty
-                                self.state.record_trade(symbol, self.settings.cooldown_seconds_per_symbol)
-                                self.state.record_order(symbol, order)
-                                self.state.clear_entry_price(symbol)
-                                self.persistence.save_order(symbol, order, "SELL", symbol_result["reason"])
-                                self.persistence.save_journal_entry(
-                                    symbol=symbol,
-                                    action="SELL",
-                                    reason=symbol_result["reason"],
-                                    entry_price=entry_price,
-                                    exit_price=exit_price,
-                                    quantity=qty,
-                                    notional=float(order.get("filled_avg_price", exit_price)) * qty if exit_price else None,
-                                    realized_pnl=realized,
-                                    drawdown=self.state.daily_equity_drawdown_usd,
-                                    raw=order,
-                                )
-                                logger.info("submitted sell order for %s: %s", symbol, order)
+                                if not self._validate_order_response(order, symbol, "sell"):
+                                    symbol_result["reason"] = "broker order validation failed"
+                                    symbol_result["blocked_by"].append("broker_validation")
+                                    symbol_result["submission_attempted"] = True
+                                    symbol_result["broker_order_accepted"] = False
+                                    logger.warning("broker order validation failed for %s: %s", symbol, order)
+                                else:
+                                    await self._reconcile_broker_state()
+                                    symbol_result["order"] = order
+                                    symbol_result["reason"] = "sell order accepted by broker"
+                                    symbol_result["submission_attempted"] = True
+                                    symbol_result["broker_order_accepted"] = True
+                                    symbol_result["broker_order_id"] = order.get("id")
+                                    symbol_result["broker_order_status"] = order.get("status")
+                                    exit_price = self._extract_filled_price(order, float(held_position.get("current_price", 0)))
+                                    entry_price = self.state.position_entry_price.get(symbol)
+                                    realized = None
+                                    if entry_price is not None:
+                                        realized = (exit_price - entry_price) * qty
+                                    self.state.record_trade(symbol, self.settings.cooldown_seconds_per_symbol)
+                                    self.state.record_order(symbol, order)
+                                    self.state.clear_entry_price(symbol)
+                                    self.persistence.save_order(symbol, order, "SELL", symbol_result["reason"])
+                                    self.persistence.save_journal_entry(
+                                        symbol=symbol,
+                                        action="SELL",
+                                        reason=symbol_result["reason"],
+                                        entry_price=entry_price,
+                                        exit_price=exit_price,
+                                        quantity=qty,
+                                        notional=float(order.get("filled_avg_price", exit_price)) * qty if exit_price else None,
+                                        realized_pnl=realized,
+                                        drawdown=self.state.daily_equity_drawdown_usd,
+                                        raw=order,
+                                    )
+                                    symbol_result["cooldown_applied"] = True
+                                    logger.info("submitted sell order for %s: %s", symbol, order)
                             except Exception as exc:
                                 symbol_result["reason"] = f"sell error: {exc}"
                                 symbol_result["blocked_by"].append("execution_error")
+                                symbol_result["submission_attempted"] = True
+                                symbol_result["broker_order_accepted"] = False
                                 logger.warning("sell error for %s: %s", symbol, exc)
 
                 else:
@@ -407,14 +442,56 @@ class TradingBot:
             self.persistence.save_state(self.state)
             return response
 
-    def _extract_filled_price(self, order: dict[str, Any], fallback: float) -> float:
+    def _validate_order_response(self, order: dict[str, Any], expected_symbol: str, expected_side: str) -> bool:
+        """Validate that the order response looks like a real Alpaca order."""
+        required_fields = ["id", "symbol", "side", "status", "submitted_at"]
+        for field in required_fields:
+            if field not in order or not order.get(field):
+                return False
+        if order.get("symbol") != expected_symbol:
+            return False
+        if order.get("side") != expected_side:
+            return False
+        # Additional checks if needed
+        return True
+
+    async def _reconcile_broker_state(self) -> None:
+        """Reconcile internal state with broker truth."""
         try:
-            filled_avg = order.get("filled_avg_price")
-            if filled_avg is not None and filled_avg != 0:
-                return float(filled_avg)
-        except (TypeError, ValueError):
-            pass
-        return fallback
+            positions = await self.trading_service.list_positions()
+            open_orders = await self.trading_service.list_orders(status="open")
+            account = await self.trading_service.get_account()
+
+            self.state.open_orders = {
+                order.get("symbol", ""): order for order in open_orders if order.get("symbol")
+            }
+            self.state.total_portfolio_exposure_usd = sum(
+                abs(float(pos.get("market_value", 0))) for pos in positions
+            )
+
+            for position in positions:
+                symbol = position.get("symbol")
+                if not symbol:
+                    continue
+                entry_price = position.get("avg_entry_price") or position.get("current_price")
+                try:
+                    if entry_price is not None:
+                        self.state.position_entry_price[symbol] = float(entry_price)
+                except (TypeError, ValueError):
+                    continue
+
+            self.persistence.save_positions(positions)
+            for order in open_orders:
+                symbol = order.get("symbol", "")
+                self.persistence.save_order(symbol, order, order.get("side", "order"), "reconciled open order")
+
+            logger.info(
+                "reconciled broker state: %d positions, %d open orders",
+                len(positions),
+                len(open_orders),
+            )
+        except Exception as exc:
+            logger.warning("Broker reconciliation failed: %s", exc)
 
     def _build_response(self, run_time: datetime, results: list[dict[str, Any]], account: dict[str, Any], positions: list[dict[str, Any]]) -> dict[str, Any]:
         self.state.last_run_time = run_time

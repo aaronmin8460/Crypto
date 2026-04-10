@@ -141,6 +141,8 @@ class BotStatusResponse(BaseModel):
     daily_symbol_trade_count: dict[str, int]
     last_signal_by_symbol: dict[str, str]
     last_order_by_symbol: dict[str, dict[str, Any]]
+    state_last_reconciled_at: datetime | None
+    broker_state_consistent: bool
 
 
 class BotLogSummaryResponse(BaseModel):

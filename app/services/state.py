@@ -34,6 +34,8 @@ class BotState(BaseModel):
     halted_reason: str | None = None
     risk_profile: dict[str, float] = Field(default_factory=lambda: {"stop_loss_pct": 0.03, "take_profit_pct": 0.05})
     position_entry_price: dict[str, float] = Field(default_factory=dict)
+    last_reconciled_at: datetime | None = None
+    broker_state_consistent: bool = True
 
     def can_trade(self, symbol: str) -> bool:
         if self.halted_reason:

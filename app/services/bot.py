@@ -54,41 +54,9 @@ class TradingBot:
         self.persistence.close()
         logger.info("bot persistence closed")
 
-    async def reconcile_broker_state(self) -> None:
-        try:
-            positions = await self.trading_service.list_positions()
-            open_orders = await self.trading_service.list_orders(status="open")
-
-            self.state.open_orders = {
-                order.get("symbol", ""): order for order in open_orders if order.get("symbol")
-            }
-            self.state.total_portfolio_exposure_usd = sum(
-                abs(float(pos.get("market_value", 0))) for pos in positions
-            )
-
-            for position in positions:
-                symbol = position.get("symbol")
-                if not symbol:
-                    continue
-                entry_price = position.get("avg_entry_price") or position.get("current_price")
-                try:
-                    if entry_price is not None:
-                        self.state.position_entry_price[symbol] = float(entry_price)
-                except (TypeError, ValueError):
-                    continue
-
-            self.persistence.save_positions(positions)
-            for order in open_orders:
-                symbol = order.get("symbol", "")
-                self.persistence.save_order(symbol, order, order.get("side", "order"), "reconciled open order")
-
-            logger.info(
-                "reconciled broker state: %d positions, %d open orders",
-                len(positions),
-                len(open_orders),
-            )
-        except Exception as exc:
-            logger.warning("Broker reconciliation failed: %s", exc)
+    async def reconcile_broker_state(self) -> dict[str, Any]:
+        """Public method to reconcile with broker truth."""
+        return await self._reconcile_broker_state()
 
     async def _fetch_bars_with_retry(self, symbol: str, timeframe: str, limit: int) -> tuple[Any, str]:
         max_retries = 2
@@ -455,43 +423,107 @@ class TradingBot:
         # Additional checks if needed
         return True
 
-    async def _reconcile_broker_state(self) -> None:
-        """Reconcile internal state with broker truth."""
-        try:
-            positions = await self.trading_service.list_positions()
-            open_orders = await self.trading_service.list_orders(status="open")
-            account = await self.trading_service.get_account()
+    def _is_broker_backed_order(self, order: dict[str, Any]) -> bool:
+        """Check if an order dict looks like a real broker-backed order."""
+        return self._validate_order_response(order, order.get("symbol", ""), order.get("side", ""))
 
+    async def _reconcile_broker_state(self) -> dict[str, Any]:
+        """Reconcile internal state with broker truth, purging stale state."""
+        try:
+            account = await self.trading_service.get_account()
+            positions = await self.trading_service.list_positions()
+            open_orders = await self.trading_service.list_orders(status="all", limit=100)  # Get recent orders
+
+            # Build broker-backed order set
+            broker_order_ids = {order.get("id") for order in open_orders if order.get("id")}
+            broker_positions = {pos["symbol"]: pos for pos in positions}
+
+            # Purge stale last_order_by_symbol
+            stale_orders_cleared = 0
+            for symbol, order in list(self.state.last_order_by_symbol.items()):
+                if not self._is_broker_backed_order(order):
+                    del self.state.last_order_by_symbol[symbol]
+                    stale_orders_cleared += 1
+                elif order.get("id") not in broker_order_ids:
+                    # Order not in recent broker orders, might be filled/canceled
+                    if symbol not in broker_positions:
+                        # No position, so order is stale
+                        del self.state.last_order_by_symbol[symbol]
+                        stale_orders_cleared += 1
+
+            # Recompute entry prices from positions
+            for symbol, pos in broker_positions.items():
+                entry_price = pos.get("avg_entry_price") or pos.get("current_price")
+                if entry_price:
+                    try:
+                        self.state.position_entry_price[symbol] = float(entry_price)
+                    except (TypeError, ValueError):
+                        pass
+
+            # Clear entry prices for symbols not in positions
+            for symbol in list(self.state.position_entry_price.keys()):
+                if symbol not in broker_positions:
+                    del self.state.position_entry_price[symbol]
+
+            # Recompute open_orders
             self.state.open_orders = {
                 order.get("symbol", ""): order for order in open_orders if order.get("symbol")
             }
+
+            # Recompute total_portfolio_exposure_usd
             self.state.total_portfolio_exposure_usd = sum(
                 abs(float(pos.get("market_value", 0))) for pos in positions
             )
 
-            for position in positions:
-                symbol = position.get("symbol")
-                if not symbol:
-                    continue
-                entry_price = position.get("avg_entry_price") or position.get("current_price")
-                try:
-                    if entry_price is not None:
-                        self.state.position_entry_price[symbol] = float(entry_price)
-                except (TypeError, ValueError):
-                    continue
+            # Recompute daily_order_count and daily_symbol_trade_count from broker orders
+            today = self.state.daily_order_date
+            if today:
+                today_str = today.isoformat()
+                broker_orders_today = [
+                    order for order in open_orders
+                    if order.get("submitted_at", "").startswith(today_str[:10])  # Date match
+                ]
+                self.state.daily_order_count = len(broker_orders_today)
+                self.state.daily_symbol_trade_count = {}
+                for order in broker_orders_today:
+                    symbol = order.get("symbol", "")
+                    if symbol:
+                        self.state.daily_symbol_trade_count[symbol] = self.state.daily_symbol_trade_count.get(symbol, 0) + 1
 
+            # Clear cooldowns not backed by recent orders or positions
+            cooldowns_cleared = 0
+            for symbol in list(self.state.cooldowns.keys()):
+                has_recent_order = any(
+                    order.get("symbol") == symbol and order.get("submitted_at", "").startswith(today_str[:10] if today else "")
+                    for order in open_orders
+                )
+                has_position = symbol in broker_positions
+                if not (has_recent_order or has_position):
+                    del self.state.cooldowns[symbol]
+                    cooldowns_cleared += 1
+
+            # Save positions
             self.persistence.save_positions(positions)
             for order in open_orders:
                 symbol = order.get("symbol", "")
                 self.persistence.save_order(symbol, order, order.get("side", "order"), "reconciled open order")
 
-            logger.info(
-                "reconciled broker state: %d positions, %d open orders",
-                len(positions),
-                len(open_orders),
-            )
+            summary = {
+                "stale_orders_cleared": stale_orders_cleared,
+                "cooldowns_cleared": cooldowns_cleared,
+                "positions_synced": len(positions),
+                "open_orders_synced": len(open_orders),
+                "daily_order_count_recomputed": self.state.daily_order_count,
+                "broker_state_consistent": True,
+            }
+            self.state.last_reconciled_at = datetime.now(timezone.utc)
+            self.state.broker_state_consistent = True
+            logger.info("reconciled broker state: %s", summary)
+            return summary
         except Exception as exc:
             logger.warning("Broker reconciliation failed: %s", exc)
+            self.state.broker_state_consistent = False
+            return {"error": str(exc), "broker_state_consistent": False}
 
     def _build_response(self, run_time: datetime, results: list[dict[str, Any]], account: dict[str, Any], positions: list[dict[str, Any]]) -> dict[str, Any]:
         self.state.last_run_time = run_time
@@ -585,4 +617,6 @@ class TradingBot:
             "daily_symbol_trade_count": self.state.daily_symbol_trade_count,
             "last_signal_by_symbol": self.state.last_signal_by_symbol,
             "last_order_by_symbol": self.state.last_order_by_symbol,
+            "state_last_reconciled_at": getattr(self.state, 'last_reconciled_at', None),
+            "broker_state_consistent": getattr(self.state, 'broker_state_consistent', True),
         }

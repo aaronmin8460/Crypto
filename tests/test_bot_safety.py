@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from unittest.mock import AsyncMock, patch
 
 import pandas as pd
+from fastapi.testclient import TestClient
 
+from app.api.app import app
 from app.config.settings import AppSettings
 from app.services.alpaca_crypto_data import AlpacaCryptoData
 from app.services.alpaca_trading import AlpacaTrading
@@ -234,6 +236,47 @@ def test_broker_reconciliation_clears_stale_state():
     asyncio.run(bot._reconcile_broker_state())
 
     assert bot.state.open_orders == {}  # Cleared
+
+
+def test_broker_reconciliation_clears_stale_state():
+    settings = AppSettings(broker_mode="paper", trading_enabled=True)
+    bot = TradingBot(settings, AsyncMock(spec=AlpacaCryptoData), AsyncMock(spec=AlpacaTrading))
+    # Simulate stale state: fake order in last_order_by_symbol, cooldown, daily count
+    fake_order = {"id": "fake123", "symbol": "BTC/USD", "qty": "0.01", "side": "buy", "type": "market", "status": "filled", "submitted_at": "2023-01-01T00:00:00Z"}
+    bot.state.last_order_by_symbol["BTC/USD"] = fake_order
+    bot.state.cooldowns["BTC/USD"] = datetime.now(timezone.utc) + timedelta(minutes=5)
+    bot.state.daily_order_count = 5
+    bot.state.daily_order_date = date.today()
+    with patch.object(bot.trading_service, "get_account", AsyncMock(return_value={"cash": "10000", "portfolio_value": "10000"})), \
+         patch.object(bot.trading_service, "list_positions", AsyncMock(return_value=[])), \
+         patch.object(bot.trading_service, "list_orders", AsyncMock(return_value=[])):
+        result = asyncio.run(bot._reconcile_broker_state())
+
+    # Assert stale state cleared
+    assert bot.state.last_order_by_symbol == {}
+    assert bot.state.cooldowns == {}
+    assert bot.state.daily_order_count == 0
+    assert bot.state.daily_symbol_trade_count == {}
+    assert result["stale_orders_cleared"] == 1
+    assert result["cooldowns_cleared"] == 1
+    assert result["broker_state_consistent"] is True
+
+
+def test_reconcile_endpoint_returns_summary():
+    client = TestClient(app)
+    with patch.object(app.state.bot, "reconcile_broker_state", AsyncMock(return_value={
+        "stale_orders_cleared": 1,
+        "cooldowns_cleared": 1,
+        "positions_synced": 0,
+        "open_orders_synced": 0,
+        "daily_order_count_recomputed": 0,
+        "broker_state_consistent": True,
+    })) as reconcile_mock:
+        response = client.post("/bot/reconcile-state")
+        assert response.status_code == 200
+        assert response.json()["status"] == "state reconciled"
+        assert response.json()["stale_orders_cleared"] == 1
+        reconcile_mock.assert_awaited_once()
 
 
 def test_bot_halt_and_resume_changes_state():

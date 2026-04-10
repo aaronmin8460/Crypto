@@ -68,6 +68,7 @@ If port `8000` is already in use, add `--port 8001`.
 - `POST /bot/halt`
 - `POST /bot/resume`
 - `POST /bot/reset-risk`
+- `POST /bot/reconcile-state`
 - `GET /bot/status`
 - `GET /bot/log-summary`
 - `GET /metrics`
@@ -85,6 +86,7 @@ curl -X POST http://127.0.0.1:8000/bot/status
 curl -X POST http://127.0.0.1:8000/bot/halt
 curl -X POST http://127.0.0.1:8000/bot/resume
 curl -X POST http://127.0.0.1:8000/bot/reset-risk
+curl -X POST http://127.0.0.1:8000/bot/reconcile-state
 curl http://127.0.0.1:8000/metrics
 curl http://127.0.0.1:8000/journal
 curl http://127.0.0.1:8000/performance

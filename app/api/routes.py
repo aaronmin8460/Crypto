@@ -164,6 +164,17 @@ async def bot_reset_risk(request: Request):
     }
 
 
+@router.post("/bot/reconcile-state")
+async def bot_reconcile_state(request: Request):
+    bot = _get_bot(request)
+    summary = await bot.reconcile_broker_state()
+    bot.persistence.save_state(bot.state)
+    return {
+        "status": "state reconciled",
+        **summary,
+    }
+
+
 @router.get("/bot/status", response_model=BotStatusResponse)
 async def bot_status(request: Request):
     bot = _get_bot(request)

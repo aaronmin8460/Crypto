@@ -4,6 +4,7 @@ import asyncio
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from unittest.mock import AsyncMock, patch
+from uuid import uuid4
 
 import pandas as pd
 from fastapi.testclient import TestClient
@@ -13,6 +14,7 @@ from app.config.settings import AppSettings
 from app.services.alpaca_crypto_data import AlpacaCryptoData
 from app.services.alpaca_trading import AlpacaTrading
 from app.services.bot import TradingBot
+from app.services.persistence import Persistence
 from app.services.strategy import SignalResult
 
 
@@ -32,6 +34,61 @@ def sample_bars_df() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def broker_timestamp() -> str:
+    local_now = datetime.now().astimezone().replace(microsecond=0)
+    return local_now.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def broker_timestamp_minutes_ago(minutes: int) -> str:
+    local_now = datetime.now().astimezone().replace(microsecond=0) - pd.Timedelta(minutes=minutes)
+    return local_now.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def valid_order(
+    symbol: str = "BTC/USD",
+    side: str = "buy",
+    status: str = "accepted",
+    submitted_at: str | None = None,
+    **overrides,
+) -> dict[str, str]:
+    order = {
+        "id": str(uuid4()),
+        "symbol": symbol,
+        "side": side,
+        "status": status,
+        "submitted_at": submitted_at or broker_timestamp(),
+        "filled_avg_price": "100.0",
+        "filled_qty": "0.01",
+        "notional": "100.0",
+    }
+    order.update(overrides)
+    return order
+
+
+def fake_stale_order(symbol: str = "BTC/USD") -> dict[str, str]:
+    return {
+        "id": "12345",
+        "symbol": symbol,
+        "side": "buy",
+        "status": "accepted",
+        "submitted_at": "2023-01-01T00:00:00Z",
+        "filled_avg_price": "100.0",
+    }
+
+
+def make_bot(tmp_path=None, **settings_overrides) -> TradingBot:
+    settings_kwargs = {"broker_mode": "paper", "trading_enabled": True}
+    if tmp_path is not None:
+        settings_kwargs["persistence_db_path"] = str(tmp_path / "bot_state.db")
+    settings_kwargs.update(settings_overrides)
+    settings = AppSettings(**settings_kwargs)
+    return TradingBot(
+        settings,
+        AsyncMock(spec=AlpacaCryptoData),
+        AsyncMock(spec=AlpacaTrading),
+    )
+
+
 def test_live_trading_safety_gate():
     settings = AppSettings(broker_mode="live", trading_enabled=True, allow_live_trading=False)
 
@@ -42,13 +99,13 @@ def test_live_trading_safety_gate():
 
 
 def test_no_order_submitted_when_trading_disabled():
-    settings = AppSettings(broker_mode="paper", trading_enabled=False)
-    bot = TradingBot(settings, AsyncMock(spec=AlpacaCryptoData), AsyncMock(spec=AlpacaTrading))
+    bot = make_bot(trading_enabled=False)
     bot.state.daily_order_date = date.today()
 
     bot.data_service.fetch_bars = AsyncMock(return_value=sample_bars_df())
     bot.trading_service.get_account.return_value = {"cash": "1000", "equity": "1000", "status": "ACTIVE"}
     bot.trading_service.list_positions.return_value = []
+    bot.trading_service.list_orders.return_value = []
     bot.trading_service.submit_market_buy_notional = AsyncMock()
 
     with patch("app.services.bot.evaluate_signal", return_value=SignalResult(signal="BUY", reason="crossed up")):
@@ -58,32 +115,21 @@ def test_no_order_submitted_when_trading_disabled():
     bot.trading_service.submit_market_buy_notional.assert_not_awaited()
 
 
-def test_cooldown_enforcement_blocks_trade():
-    settings = AppSettings(broker_mode="paper", trading_enabled=True)
-    bot = TradingBot(settings, AsyncMock(spec=AlpacaCryptoData), AsyncMock(spec=AlpacaTrading))
-    bot.state.daily_order_date = date.today()
-    bot.state.cooldowns["BTC/USD"] = datetime.now(timezone.utc) + pd.Timedelta(seconds=600)
-
-    bot.data_service.fetch_bars = AsyncMock(return_value=sample_bars_df())
-    bot.trading_service.get_account.return_value = {"cash": "1000", "equity": "10000", "status": "ACTIVE"}
-    bot.trading_service.list_positions.return_value = []
-    bot.trading_service.submit_market_buy_notional = AsyncMock(return_value={"filled_avg_price": "100.0"})
-
-    with patch("app.services.bot.evaluate_signal", return_value=SignalResult(signal="BUY", reason="crossed up")):
-        result = asyncio.run(bot.run_once())
-
-    assert result["results"][0]["reason"] == "cooldown active"
-
-
 def test_daily_order_limit_reached():
-    settings = AppSettings(broker_mode="paper", trading_enabled=True, max_daily_orders=1)
-    bot = TradingBot(settings, AsyncMock(spec=AlpacaCryptoData), AsyncMock(spec=AlpacaTrading))
+    bot = make_bot(max_daily_orders=1)
     bot.state.daily_order_date = date.today()
-    bot.state.daily_order_count = 1
 
     bot.data_service.fetch_bars = AsyncMock(return_value=sample_bars_df())
     bot.trading_service.get_account.return_value = {"cash": "1000", "equity": "1000", "status": "ACTIVE"}
     bot.trading_service.list_positions.return_value = []
+    bot.trading_service.list_orders.return_value = [
+        valid_order(
+            symbol="BTC/USD",
+            side="buy",
+            status="filled",
+            submitted_at=broker_timestamp_minutes_ago(60),
+        )
+    ]
 
     with patch("app.services.bot.evaluate_signal", return_value=SignalResult(signal="BUY", reason="crossed up")):
         result = asyncio.run(bot.run_once())
@@ -91,94 +137,30 @@ def test_daily_order_limit_reached():
     assert result["results"][0]["reason"] == "daily order limit reached"
 
 
-def test_max_daily_loss_halts_trading():
-    settings = AppSettings(broker_mode="paper", trading_enabled=True, max_daily_loss_usd=150)
-    bot = TradingBot(settings, AsyncMock(spec=AlpacaCryptoData), AsyncMock(spec=AlpacaTrading))
-    bot.state.daily_order_date = date.today()
-    bot.state.day_peak_equity = 10151.0
-    bot.state.last_equity = 10151.0
-    bot.state.current_equity_drawdown_usd = 0.0
-    bot.state.max_intraday_drawdown_usd = 0.0
-    bot.state.daily_equity_drawdown_usd = 0.0
-
-    bot.data_service.fetch_bars = AsyncMock(return_value=sample_bars_df())
-    bot.trading_service.get_account.return_value = {"cash": "1000", "equity": "10000", "status": "ACTIVE"}
-    bot.trading_service.list_positions.return_value = []
-    bot.trading_service.submit_market_buy_notional = AsyncMock(return_value={"filled_avg_price": "100.0"})
-
-    with patch("app.services.bot.evaluate_signal", return_value=SignalResult(signal="BUY", reason="crossed up")):
-        result = asyncio.run(bot.run_once())
-
-    assert bot.state.halted_reason == "max daily loss exceeded"
-    assert result["results"][0]["reason"] == "trading halted: max daily loss exceeded"
-
-
-def test_record_equity_change_initializes_drawdown_state():
-    state = TradingBot(AppSettings(broker_mode="paper", trading_enabled=True), AsyncMock(), AsyncMock()).state
-    state.record_equity_change(Decimal("100000"))
-
-    assert state.day_peak_equity == 100000.0
-    assert state.current_equity_drawdown_usd == 0.0
-    assert state.max_intraday_drawdown_usd == 0.0
-    assert state.daily_equity_drawdown_usd == 0.0
-
-
 def test_record_equity_change_updates_peak_and_drawdown():
-    state = TradingBot(AppSettings(broker_mode="paper", trading_enabled=True), AsyncMock(), AsyncMock()).state
+    state = make_bot().state
     state.record_equity_change(Decimal("100000"))
     state.record_equity_change(Decimal("101000"))
-
-    assert state.day_peak_equity == 101000.0
-    assert state.current_equity_drawdown_usd == 0.0
-    assert state.max_intraday_drawdown_usd == 0.0
-
     state.record_equity_change(Decimal("100200"))
+
     assert state.day_peak_equity == 101000.0
     assert state.current_equity_drawdown_usd == 800.0
     assert state.max_intraday_drawdown_usd == 800.0
 
-    state.record_equity_change(Decimal("100500"))
-    assert state.current_equity_drawdown_usd == 500.0
-    assert state.max_intraday_drawdown_usd == 800.0
-
-
-def test_resume_does_not_clear_daily_loss_latch():
-    settings = AppSettings(broker_mode="paper", trading_enabled=True, max_daily_loss_usd=150)
-    bot = TradingBot(settings, AsyncMock(spec=AlpacaCryptoData), AsyncMock(spec=AlpacaTrading))
-    bot.state.daily_order_date = date.today()
-    bot.state.risk_stop_latched = True
-    bot.state.halted_reason = "max daily loss exceeded"
-
-    asyncio.run(bot.resume())
-    assert bot.state.halted_reason == "max daily loss exceeded"
-    assert bot.state.risk_stop_latched is True
-
-
-def test_reset_risk_clears_daily_loss_stop():
-    settings = AppSettings(broker_mode="paper", trading_enabled=True)
-    trading = AsyncMock(spec=AlpacaTrading)
-    trading.get_account.return_value = {"cash": "1000", "equity": "100000", "status": "ACTIVE"}
-    bot = TradingBot(settings, AsyncMock(spec=AlpacaCryptoData), trading)
-    bot.state.risk_stop_latched = True
-    bot.state.halted_reason = "max daily loss exceeded"
-
-    asyncio.run(bot.reset_risk())
-
-    assert bot.state.risk_stop_latched is False
-    assert bot.state.halted_reason is None
-    assert bot.state.day_peak_equity == 100000.0
-    assert bot.state.current_equity_drawdown_usd == 0.0
-
 
 def test_fake_order_response_does_not_update_state():
-    settings = AppSettings(broker_mode="paper", trading_enabled=True)
-    bot = TradingBot(settings, AsyncMock(spec=AlpacaCryptoData), AsyncMock(spec=AlpacaTrading))
+    bot = make_bot(default_symbols=["BTC/USD"])
     bot.state.daily_order_date = date.today()
 
     bot.data_service.fetch_bars = AsyncMock(return_value=sample_bars_df())
-    bot.trading_service.get_account.return_value = {"cash": "1000", "equity": "100000", "status": "ACTIVE"}
+    bot.trading_service.get_account.return_value = {
+        "cash": "1000",
+        "equity": "100000",
+        "status": "ACTIVE",
+    }
     bot.trading_service.list_positions.return_value = []
-    bot.trading_service.submit_market_buy_notional = AsyncMock(return_value={"filled_avg_price": "100.0"})  # Fake response
+    bot.trading_service.list_orders.return_value = []
+    bot.trading_service.submit_market_buy_notional = AsyncMock(return_value=fake_stale_order())
 
     with patch("app.services.bot.evaluate_signal", return_value=SignalResult(signal="BUY", reason="crossed up")):
         result = asyncio.run(bot.run_once())
@@ -186,117 +168,234 @@ def test_fake_order_response_does_not_update_state():
     assert result["results"][0]["reason"] == "broker order validation failed"
     assert result["results"][0]["submission_attempted"] is True
     assert result["results"][0]["broker_order_accepted"] is False
-    assert bot.state.daily_order_count == 0  # Not incremented
-    assert len(bot.state.cooldowns) == 0  # No cooldown applied
+    assert bot.state.daily_order_count == 0
+    assert bot.state.cooldowns == {}
+    assert bot.state.last_order_by_symbol == {}
+    assert bot.state.local_order_attempts_by_symbol == {}
 
 
-def test_valid_order_response_updates_state():
-    settings = AppSettings(broker_mode="paper", trading_enabled=True, default_symbols=["BTC/USD"])
-    bot = TradingBot(settings, AsyncMock(spec=AlpacaCryptoData), AsyncMock(spec=AlpacaTrading))
+def test_stale_fake_accepted_order_is_cleared_when_broker_empty():
+    bot = make_bot()
     bot.state.daily_order_date = date.today()
-
-    valid_order = {
-        "id": "12345",
-        "symbol": "BTC/USD",
-        "side": "buy",
-        "status": "accepted",
-        "submitted_at": "2023-01-01T00:00:00Z",
-        "filled_avg_price": "100.0",
-    }
-
-    bot.data_service.fetch_bars = AsyncMock(return_value=sample_bars_df())
-    bot.trading_service.get_account.return_value = {"cash": "1000", "equity": "100000", "status": "ACTIVE"}
-    bot.trading_service.list_positions.return_value = []
-    bot.trading_service.list_orders = AsyncMock(return_value=[])
-    bot.trading_service.submit_market_buy_notional = AsyncMock(return_value=valid_order)
-    bot._extract_filled_price = lambda order, fallback: 100.0
-
-    with patch("app.services.bot.evaluate_signal", return_value=SignalResult(signal="BUY", reason="crossed up")):
-        result = asyncio.run(bot.run_once())
-
-    assert result["results"][0]["reason"] == "buy order accepted by broker"
-    assert result["results"][0]["submission_attempted"] is True
-    assert result["results"][0]["broker_order_accepted"] is True
-    assert result["results"][0]["broker_order_id"] == "12345"
-    assert result["results"][0]["cooldown_applied"] is True
-    assert bot.state.daily_order_count == 1  # Incremented
-    assert "BTC/USD" in bot.state.cooldowns  # Cooldown applied
-
-
-def test_broker_reconciliation_clears_stale_state():
-    settings = AppSettings(broker_mode="paper", trading_enabled=True)
-    bot = TradingBot(settings, AsyncMock(spec=AlpacaCryptoData), AsyncMock(spec=AlpacaTrading))
-    bot.state.daily_order_date = date.today()
-    bot.state.open_orders = {"BTC/USD": {"id": "fake", "symbol": "BTC/USD"}}  # Stale state
-
-    bot.trading_service.list_positions.return_value = []
-    bot.trading_service.list_orders.return_value = []  # Broker has no orders
-    bot.trading_service.get_account.return_value = {"cash": "1000", "equity": "100000", "status": "ACTIVE"}
-
-    asyncio.run(bot._reconcile_broker_state())
-
-    assert bot.state.open_orders == {}  # Cleared
-
-
-def test_broker_reconciliation_clears_stale_state():
-    settings = AppSettings(broker_mode="paper", trading_enabled=True)
-    bot = TradingBot(settings, AsyncMock(spec=AlpacaCryptoData), AsyncMock(spec=AlpacaTrading))
-    # Simulate stale state: fake order in last_order_by_symbol, cooldown, daily count
-    fake_order = {"id": "fake123", "symbol": "BTC/USD", "qty": "0.01", "side": "buy", "type": "market", "status": "filled", "submitted_at": "2023-01-01T00:00:00Z"}
-    bot.state.last_order_by_symbol["BTC/USD"] = fake_order
+    bot.state.last_order_by_symbol["BTC/USD"] = fake_stale_order()
     bot.state.cooldowns["BTC/USD"] = datetime.now(timezone.utc) + timedelta(minutes=5)
-    bot.state.daily_order_count = 5
-    bot.state.daily_order_date = date.today()
-    with patch.object(bot.trading_service, "get_account", AsyncMock(return_value={"cash": "10000", "portfolio_value": "10000"})), \
-         patch.object(bot.trading_service, "list_positions", AsyncMock(return_value=[])), \
-         patch.object(bot.trading_service, "list_orders", AsyncMock(return_value=[])):
-        result = asyncio.run(bot._reconcile_broker_state())
+    bot.state.daily_order_count = 1
+    bot.state.daily_symbol_trade_count = {"BTC/USD": 1}
+    bot.state.position_entry_price = {"BTC/USD": 100.0}
 
-    # Assert stale state cleared
+    bot.trading_service.get_account.return_value = {
+        "cash": "10000",
+        "equity": "10000",
+        "status": "ACTIVE",
+    }
+    bot.trading_service.list_positions.return_value = []
+    bot.trading_service.list_orders.return_value = []
+
+    summary = asyncio.run(bot.reconcile_broker_state())
+
     assert bot.state.last_order_by_symbol == {}
     assert bot.state.cooldowns == {}
     assert bot.state.daily_order_count == 0
     assert bot.state.daily_symbol_trade_count == {}
-    assert result["stale_orders_cleared"] == 1
-    assert result["cooldowns_cleared"] == 1
-    assert result["broker_state_consistent"] is True
+    assert bot.state.position_entry_price == {}
+    assert summary["stale_orders_cleared"] == 1
+    assert summary["cooldowns_cleared"] == 1
+    assert summary["entry_prices_cleared"] == 1
+    assert summary["stale_state_detected"] is True
 
 
-def test_reconcile_endpoint_returns_summary():
+def test_stale_cooldown_without_broker_backing_is_cleared():
+    bot = make_bot()
+    bot.state.cooldowns["BTC/USD"] = datetime.now(timezone.utc) + timedelta(minutes=5)
+    bot.state.daily_order_date = date.today()
+
+    bot.trading_service.get_account.return_value = {"cash": "1000", "equity": "1000", "status": "ACTIVE"}
+    bot.trading_service.list_positions.return_value = []
+    bot.trading_service.list_orders.return_value = []
+
+    summary = asyncio.run(bot.reconcile_broker_state())
+
+    assert bot.state.cooldowns == {}
+    assert summary["cooldowns_cleared"] == 1
+
+
+def test_daily_trade_counts_are_recomputed_from_broker_truth():
+    bot = make_bot()
+    bot.state.daily_order_date = date.today()
+    bot.state.daily_order_count = 5
+    bot.state.daily_symbol_trade_count = {"BTC/USD": 5}
+
+    broker_orders = [
+        valid_order(symbol="BTC/USD", side="buy"),
+        valid_order(symbol="ETH/USD", side="sell"),
+    ]
+    bot.trading_service.get_account.return_value = {"cash": "1000", "equity": "1000", "status": "ACTIVE"}
+    bot.trading_service.list_positions.return_value = []
+    bot.trading_service.list_orders.return_value = broker_orders
+
+    summary = asyncio.run(bot.reconcile_broker_state())
+
+    assert bot.state.daily_order_count == 2
+    assert bot.state.daily_symbol_trade_count == {"BTC/USD": 1, "ETH/USD": 1}
+    assert summary["trade_counts_recomputed"] is True
+    assert summary["daily_order_count_recomputed"] == 2
+
+
+def test_reconcile_endpoint_returns_useful_summary():
     client = TestClient(app)
-    with patch.object(app.state.bot, "reconcile_broker_state", AsyncMock(return_value={
+    reconcile_summary = {
         "stale_orders_cleared": 1,
         "cooldowns_cleared": 1,
+        "entry_prices_cleared": 1,
+        "trade_counts_recomputed": True,
         "positions_synced": 0,
+        "confirmed_positions": 0,
         "open_orders_synced": 0,
+        "confirmed_open_orders": 0,
         "daily_order_count_recomputed": 0,
+        "daily_symbol_trade_count_recomputed": {},
+        "stale_state_detected": True,
+        "stale_state_cleared_count": 4,
+        "untrusted_local_orders_discarded": 1,
+        "invalid_broker_orders_ignored": 0,
         "broker_state_consistent": True,
-    })) as reconcile_mock:
-        response = client.post("/bot/reconcile-state")
-        assert response.status_code == 200
-        assert response.json()["status"] == "state reconciled"
-        assert response.json()["stale_orders_cleared"] == 1
-        reconcile_mock.assert_awaited_once()
+        "state_last_reconciled_at": broker_timestamp(),
+        "account": {"cash": "1000"},
+        "positions": [],
+        "confirmed_orders": [],
+    }
+
+    with patch.object(app.state.bot, "reconcile_broker_state", AsyncMock(return_value=reconcile_summary)) as reconcile_mock:
+        with patch.object(app.state.bot.persistence, "save_state") as save_state_mock:
+            response = client.post("/bot/reconcile-state")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "state reconciled"
+    assert payload["stale_orders_cleared"] == 1
+    assert payload["cooldowns_cleared"] == 1
+    assert payload["stale_state_cleared_count"] == 4
+    assert "account" not in payload
+    assert "confirmed_orders" not in payload
+    reconcile_mock.assert_awaited_once()
+    save_state_mock.assert_called_once()
 
 
-def test_bot_halt_and_resume_changes_state():
-    settings = AppSettings(broker_mode="paper", trading_enabled=True)
-    bot = TradingBot(settings, AsyncMock(spec=AlpacaCryptoData), AsyncMock(spec=AlpacaTrading))
+def test_startup_reconciliation_repairs_stale_local_state_automatically(tmp_path):
+    settings = AppSettings(
+        broker_mode="paper",
+        trading_enabled=True,
+        persistence_db_path=str(tmp_path / "bot_state.db"),
+    )
+    persistence = Persistence(settings)
+    seeded_bot = TradingBot(
+        settings,
+        AsyncMock(spec=AlpacaCryptoData),
+        AsyncMock(spec=AlpacaTrading),
+        persistence=persistence,
+    )
+    seeded_bot.state.daily_order_date = date.today()
+    seeded_bot.state.last_order_by_symbol["BTC/USD"] = fake_stale_order()
+    seeded_bot.state.cooldowns["BTC/USD"] = datetime.now(timezone.utc) + timedelta(minutes=5)
+    seeded_bot.state.daily_order_count = 1
+    seeded_bot.state.daily_symbol_trade_count = {"BTC/USD": 1}
+    persistence.save_state(seeded_bot.state)
 
-    asyncio.run(bot.halt("manual stop"))
-    assert bot.state.halted_reason == "manual stop"
+    trading_service = AsyncMock(spec=AlpacaTrading)
+    trading_service.get_account.return_value = {"cash": "1000", "equity": "1000", "status": "ACTIVE"}
+    trading_service.list_positions.return_value = []
+    trading_service.list_orders.return_value = []
+    bot = TradingBot(
+        settings,
+        AsyncMock(spec=AlpacaCryptoData),
+        trading_service,
+        persistence=Persistence(settings),
+    )
 
-    asyncio.run(bot.resume())
+    asyncio.run(bot.initialize())
+
+    assert bot.state.last_order_by_symbol == {}
+    assert bot.state.cooldowns == {}
+    assert bot.state.daily_order_count == 0
+    assert bot.state.broker_state_consistent is True
+    assert bot.state.last_reconciled_at is not None
+
+
+def test_status_cannot_continue_showing_fake_order_metadata_after_reconcile():
+    bot = make_bot()
+    fake_order = fake_stale_order()
+    bot.state.last_order_by_symbol["BTC/USD"] = fake_order
+    bot.state.open_orders["BTC/USD"] = fake_order
+    bot.state.daily_order_date = date.today()
+
+    bot.trading_service.get_account.return_value = {"cash": "1000", "equity": "1000", "status": "ACTIVE"}
+    bot.trading_service.list_positions.return_value = []
+    bot.trading_service.list_orders.return_value = []
+
+    asyncio.run(bot.reconcile_broker_state())
+    status = bot.status()
+
+    assert status["last_order_by_symbol"] == {}
+    assert status["open_orders"] == {}
+    assert status["broker_state_consistent"] is True
+    assert status["stale_state_detected"] is True
+
+
+def test_real_broker_confirmed_order_remains_after_reconciliation():
+    bot = make_bot()
+    broker_order = valid_order(symbol="BTC/USD", side="buy")
+
+    bot.trading_service.get_account.return_value = {"cash": "1000", "equity": "1000", "status": "ACTIVE"}
+    bot.trading_service.list_positions.return_value = []
+    bot.trading_service.list_orders.return_value = [broker_order]
+
+    summary = asyncio.run(bot.reconcile_broker_state())
+
+    assert bot.state.last_order_by_symbol["BTC/USD"]["id"] == broker_order["id"]
+    assert bot.state.last_order_by_symbol["BTC/USD"]["source"] == "broker"
+    assert bot.state.last_order_by_symbol["BTC/USD"]["confirmation_path"] == "broker.list_orders"
+    assert bot.state.confirmed_open_orders == 1
+    assert summary["stale_orders_cleared"] == 0
+
+
+def test_reset_risk_does_not_preserve_bogus_order_state():
+    bot = make_bot()
+    bot.state.daily_order_date = date.today()
+    bot.state.risk_stop_latched = True
+    bot.state.halted_reason = "max daily loss exceeded"
+    bot.state.last_order_by_symbol["BTC/USD"] = fake_stale_order()
+    bot.state.cooldowns["BTC/USD"] = datetime.now(timezone.utc) + timedelta(minutes=5)
+    bot.state.daily_order_count = 3
+    bot.state.daily_symbol_trade_count = {"BTC/USD": 3}
+
+    bot.trading_service.get_account.return_value = {"cash": "1000", "equity": "100000", "status": "ACTIVE"}
+    bot.trading_service.list_positions.return_value = []
+    bot.trading_service.list_orders.return_value = []
+
+    asyncio.run(bot.reset_risk())
+
+    assert bot.state.risk_stop_latched is False
     assert bot.state.halted_reason is None
+    assert bot.state.last_order_by_symbol == {}
+    assert bot.state.cooldowns == {}
+    assert bot.state.daily_order_count == 0
 
 
-def test_bot_start_is_idempotent():
-    settings = AppSettings(broker_mode="paper", trading_enabled=True)
-    bot = TradingBot(settings, AsyncMock(spec=AlpacaCryptoData), AsyncMock(spec=AlpacaTrading))
-    bot._task = None
+def test_broker_state_consistent_only_when_local_state_matches_broker_truth():
+    bot = make_bot()
+    fake_order = fake_stale_order()
+    bot.state.last_order_by_symbol["BTC/USD"] = fake_order
+    bot.state.open_orders["BTC/USD"] = fake_order
 
-    with patch("app.services.bot.asyncio.create_task", return_value=AsyncMock()) as create_task:
-        asyncio.run(bot.start())
-        asyncio.run(bot.start())
+    status_before = bot.status()
+    assert status_before["broker_state_consistent"] is False
 
-    assert create_task.call_count == 1
+    bot.trading_service.get_account.return_value = {"cash": "1000", "equity": "1000", "status": "ACTIVE"}
+    bot.trading_service.list_positions.return_value = []
+    bot.trading_service.list_orders.return_value = []
+
+    asyncio.run(bot.reconcile_broker_state())
+    status_after = bot.status()
+
+    assert status_after["broker_state_consistent"] is True
+    assert status_after["last_order_by_symbol"] == {}

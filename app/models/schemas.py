@@ -26,6 +26,8 @@ class UsageResponse(BaseModel):
         "POST /bot/stop": "Stop background loop",
         "POST /bot/halt": "Emergency halt trading",
         "POST /bot/resume": "Resume after halt",
+        "POST /bot/reset-risk": "Reset daily risk latch and sync broker state",
+        "POST /bot/reconcile-state": "Rebuild bot state from broker truth",
         "GET /bot/status": "Bot status",
         "GET /bot/log-summary": "Summary of latest run",
         "GET /metrics": "Trading metrics and performance summary",
@@ -141,8 +143,14 @@ class BotStatusResponse(BaseModel):
     daily_symbol_trade_count: dict[str, int]
     last_signal_by_symbol: dict[str, str]
     last_order_by_symbol: dict[str, dict[str, Any]]
+    local_order_attempts_by_symbol: dict[str, dict[str, Any]]
     state_last_reconciled_at: datetime | None
     broker_state_consistent: bool
+    stale_state_detected: bool
+    stale_state_cleared_count: int
+    confirmed_open_orders: int
+    confirmed_positions: int
+    untrusted_local_orders_discarded: int
 
 
 class BotLogSummaryResponse(BaseModel):

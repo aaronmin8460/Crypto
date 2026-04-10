@@ -169,6 +169,11 @@ async def bot_reconcile_state(request: Request):
     bot = _get_bot(request)
     summary = await bot.reconcile_broker_state()
     bot.persistence.save_state(bot.state)
+    summary = {
+        key: value
+        for key, value in summary.items()
+        if key not in {"account", "positions", "confirmed_orders"}
+    }
     return {
         "status": "state reconciled",
         **summary,
@@ -178,6 +183,9 @@ async def bot_reconcile_state(request: Request):
 @router.get("/bot/status", response_model=BotStatusResponse)
 async def bot_status(request: Request):
     bot = _get_bot(request)
+    if bot.has_suspicious_state():
+        await bot.reconcile_broker_state(trigger="status_suspicion")
+        bot.persistence.save_state(bot.state)
     return BotStatusResponse(**bot.status())
 
 

@@ -86,6 +86,14 @@ def test_bot_log_summary_endpoint():
         "daily_equity_drawdown_usd": 0.0,
         "last_signal_by_symbol": {},
         "last_order_by_symbol": {},
+        "local_order_attempts_by_symbol": {},
+        "state_last_reconciled_at": None,
+        "broker_state_consistent": True,
+        "stale_state_detected": False,
+        "stale_state_cleared_count": 0,
+        "confirmed_open_orders": 0,
+        "confirmed_positions": 0,
+        "untrusted_local_orders_discarded": 0,
     }):
         response = client.get("/bot/log-summary")
 
@@ -95,31 +103,40 @@ def test_bot_log_summary_endpoint():
 
 def test_bot_status_returns_risk_fields():
     client = TestClient(app)
-    with patch.object(app.state.bot, "status", return_value={
-        "running": True,
-        "mode": "paper",
-        "trading_enabled": True,
-        "halted_reason": None,
-        "last_run_time": None,
-        "last_loop_time": None,
-        "last_error": None,
-        "consecutive_failures": 0,
-        "last_results": {},
-        "cooldowns": {},
-        "open_orders": {},
-        "risk_profile": {},
-        "daily_order_count": 0,
-        "daily_equity_drawdown_usd": 0.0,
-        "day_peak_equity": 100000.0,
-        "current_equity_drawdown_usd": 0.0,
-        "max_intraday_drawdown_usd": 0.0,
-        "risk_stop_latched": False,
-        "total_portfolio_exposure_usd": 0.0,
-        "daily_symbol_trade_count": {},
-        "last_signal_by_symbol": {},
-        "last_order_by_symbol": {},
-    }):
-        response = client.get("/bot/status")
+    with patch.object(app.state.bot, "has_suspicious_state", return_value=False):
+        with patch.object(app.state.bot, "status", return_value={
+            "running": True,
+            "mode": "paper",
+            "trading_enabled": True,
+            "halted_reason": None,
+            "last_run_time": None,
+            "last_loop_time": None,
+            "last_error": None,
+            "consecutive_failures": 0,
+            "last_results": {},
+            "cooldowns": {},
+            "open_orders": {},
+            "risk_profile": {},
+            "daily_order_count": 0,
+            "daily_equity_drawdown_usd": 0.0,
+            "day_peak_equity": 100000.0,
+            "current_equity_drawdown_usd": 0.0,
+            "max_intraday_drawdown_usd": 0.0,
+            "risk_stop_latched": False,
+            "total_portfolio_exposure_usd": 0.0,
+            "daily_symbol_trade_count": {},
+            "last_signal_by_symbol": {},
+            "last_order_by_symbol": {},
+            "local_order_attempts_by_symbol": {},
+            "state_last_reconciled_at": None,
+            "broker_state_consistent": True,
+            "stale_state_detected": False,
+            "stale_state_cleared_count": 0,
+            "confirmed_open_orders": 0,
+            "confirmed_positions": 0,
+            "untrusted_local_orders_discarded": 0,
+        }):
+            response = client.get("/bot/status")
 
     assert response.status_code == 200
     assert response.json()["day_peak_equity"] == 100000.0

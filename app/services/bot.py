@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
+from uuid import UUID
 
 import pandas as pd
 from app.config.settings import AppSettings
@@ -12,9 +13,22 @@ from app.services.alpaca_crypto_data import AlpacaCryptoData
 from app.services.alpaca_trading import AlpacaTrading
 from app.services.persistence import Persistence
 from app.services.state import BotState
-from app.services.strategy import StrategyResult, evaluate_signal
+from app.services.strategy import evaluate_signal
 
 logger = logging.getLogger(__name__)
+
+BROKER_LIST_ORDERS_PATH = "broker.list_orders"
+BROKER_SUBMIT_ORDER_PATH = "broker.submit_order"
+LOCAL_PENDING_ORDER_PATH = "local.submit_response_pending_reconcile"
+OPEN_ORDER_STATUSES = {
+    "accepted",
+    "accepted_for_bidding",
+    "held",
+    "new",
+    "partially_filled",
+    "pending_new",
+    "pending_replace",
+}
 
 
 class TradingBot:
@@ -41,10 +55,12 @@ class TradingBot:
                 self.state = BotState(**persisted)
             except Exception as exc:
                 logger.warning("Failed to restore persisted state: %s", exc)
+
         self.state.running = False
         self.state.mode = self.settings.broker_mode
         self.state.trading_enabled = self.settings.trading_enabled
-        await self.reconcile_broker_state()
+        self.state.reset_daily()
+        await self.reconcile_broker_state(trigger="startup")
         self.persistence.save_state(self.state)
         logger.info("bot initialized with persisted state")
 
@@ -54,9 +70,8 @@ class TradingBot:
         self.persistence.close()
         logger.info("bot persistence closed")
 
-    async def reconcile_broker_state(self) -> dict[str, Any]:
-        """Public method to reconcile with broker truth."""
-        return await self._reconcile_broker_state()
+    async def reconcile_broker_state(self, trigger: str = "manual") -> dict[str, Any]:
+        return await self._refresh_broker_state(trigger)
 
     async def _fetch_bars_with_retry(self, symbol: str, timeframe: str, limit: int) -> tuple[Any, str]:
         max_retries = 2
@@ -116,7 +131,11 @@ class TradingBot:
             close_last = float(bars["Close"].iloc[-1]) if len(bars) else 0.0
             if atr and close_last > 0:
                 volatility_factor = max(0.2, min(2.0, close_last / atr))
-                notional = float(equity * Decimal(str(self.settings.position_size_percent)) * Decimal(str(volatility_factor)))
+                notional = float(
+                    equity
+                    * Decimal(str(self.settings.position_size_percent))
+                    * Decimal(str(volatility_factor))
+                )
                 return min(notional, self.settings.max_position_notional_usd)
 
         return self.settings.order_notional_usd
@@ -130,22 +149,32 @@ class TradingBot:
             self.state.trading_enabled = self.settings.trading_enabled
             self.state.reset_daily()
 
-            account = await self.trading_service.get_account()
-            positions = await self.trading_service.list_positions()
-            try:
-                open_orders = await self.trading_service.list_orders(status="open")
-            except Exception as exc:
-                logger.warning("Unable to fetch open orders: %s", exc)
-                open_orders = []
+            reconciliation = await self._refresh_broker_state("run_once_preflight")
+            if reconciliation.get("account") is not None:
+                account = reconciliation["account"]
+                positions = reconciliation["positions"]
+                open_orders_by_symbol = dict(self.state.open_orders)
+            else:
+                account = await self.trading_service.get_account()
+                positions = await self.trading_service.list_positions()
+                try:
+                    open_orders = await self.trading_service.list_orders(status="open")
+                except Exception as exc:
+                    logger.warning("Unable to fetch open orders: %s", exc)
+                    open_orders = []
+                open_orders_by_symbol = {
+                    order.get("symbol", ""): order for order in open_orders if order.get("symbol")
+                }
+                self.state.open_orders = open_orders_by_symbol
+                self.state.confirmed_open_orders = len(open_orders_by_symbol)
+                self.state.confirmed_positions = len(
+                    [position for position in positions if position.get("symbol")]
+                )
+                self.state.total_portfolio_exposure_usd = sum(
+                    abs(float(position.get("market_value", 0))) for position in positions
+                )
 
-            open_orders_by_symbol = {
-                order.get("symbol", ""): order for order in open_orders if order.get("symbol")
-            }
-            self.state.open_orders = open_orders_by_symbol
-            position_map = {pos["symbol"]: pos for pos in positions}
-            self.state.total_portfolio_exposure_usd = sum(
-                abs(float(pos.get("market_value", 0))) for pos in positions
-            )
+            position_map = {position["symbol"]: position for position in positions if position.get("symbol")}
 
             equity = Decimal(str(account.get("equity", account.get("cash", "0"))))
             self.state.record_equity_change(equity)
@@ -244,11 +273,7 @@ class TradingBot:
                     )
 
                 try:
-                    signal = evaluate_signal(
-                        bars,
-                        self.settings,
-                        higher_bars=higher_bars,
-                    )
+                    signal = evaluate_signal(bars, self.settings, higher_bars=higher_bars)
                 except Exception as exc:
                     symbol_result["reason"] = f"signal error: {exc}"
                     symbol_result["blocked_by"].append("signal_error")
@@ -272,7 +297,10 @@ class TradingBot:
                     elif self.state.daily_order_count >= self.settings.max_daily_orders:
                         symbol_result["reason"] = "daily order limit reached"
                         symbol_result["blocked_by"].append("daily_order_limit")
-                    elif self.state.daily_symbol_trade_count.get(symbol, 0) >= self.settings.max_trades_per_symbol_per_day:
+                    elif (
+                        self.state.daily_symbol_trade_count.get(symbol, 0)
+                        >= self.settings.max_trades_per_symbol_per_day
+                    ):
                         symbol_result["reason"] = "symbol trade limit reached"
                         symbol_result["blocked_by"].append("symbol_trade_limit")
                     elif self.state.daily_equity_drawdown_usd >= self.settings.max_daily_loss_usd:
@@ -284,7 +312,10 @@ class TradingBot:
                             self.state.daily_equity_drawdown_usd,
                             self.settings.max_daily_loss_usd,
                         )
-                    elif self.state.total_portfolio_exposure_usd >= self.settings.max_portfolio_exposure_usd:
+                    elif (
+                        self.state.total_portfolio_exposure_usd
+                        >= self.settings.max_portfolio_exposure_usd
+                    ):
                         symbol_result["reason"] = "portfolio exposure limit reached"
                         symbol_result["blocked_by"].append("portfolio_exposure")
                     else:
@@ -295,45 +326,106 @@ class TradingBot:
                         elif notional > self.settings.max_position_notional_usd:
                             symbol_result["reason"] = "notional exceeds max position notional"
                             symbol_result["blocked_by"].append("max_position_notional")
-                        elif self.state.total_portfolio_exposure_usd + notional > self.settings.max_portfolio_exposure_usd:
+                        elif (
+                            self.state.total_portfolio_exposure_usd + notional
+                            > self.settings.max_portfolio_exposure_usd
+                        ):
                             symbol_result["reason"] = "would exceed portfolio exposure limit"
                             symbol_result["blocked_by"].append("portfolio_exposure")
                         else:
                             try:
-                                order = await self.trading_service.submit_market_buy_notional(symbol, notional)
-                                if not self._validate_order_response(order, symbol, "buy"):
+                                order = await self.trading_service.submit_market_buy_notional(
+                                    symbol, notional
+                                )
+                                symbol_result["submission_attempted"] = True
+                                symbol_result["broker_order_id"] = order.get("id")
+                                symbol_result["broker_order_status"] = order.get("status")
+                                if not self._validate_order_response(
+                                    order,
+                                    symbol,
+                                    "buy",
+                                    confirmation_path=BROKER_SUBMIT_ORDER_PATH,
+                                ):
                                     symbol_result["reason"] = "broker order validation failed"
                                     symbol_result["blocked_by"].append("broker_validation")
-                                    symbol_result["submission_attempted"] = True
-                                    symbol_result["broker_order_accepted"] = False
-                                    logger.warning("broker order validation failed for %s: %s", symbol, order)
-                                else:
-                                    await self._reconcile_broker_state()
-                                    symbol_result["order"] = order
-                                    symbol_result["reason"] = "buy order accepted by broker"
-                                    symbol_result["submission_attempted"] = True
-                                    symbol_result["broker_order_accepted"] = True
-                                    symbol_result["broker_order_id"] = order.get("id")
-                                    symbol_result["broker_order_status"] = order.get("status")
-                                    entry_price = self._extract_filled_price(order, float(bars.iloc[-1]["Close"]))
-                                    self.state.record_entry_price(symbol, entry_price)
-                                    self.state.record_trade(symbol, self.settings.cooldown_seconds_per_symbol)
-                                    self.state.record_order(symbol, order)
-                                    self.persistence.save_order(symbol, order, "BUY", symbol_result["reason"])
-                                    self.persistence.save_journal_entry(
-                                        symbol=symbol,
-                                        action="BUY",
-                                        reason=symbol_result["reason"],
-                                        entry_price=entry_price,
-                                        exit_price=None,
-                                        quantity=float(order.get("filled_qty", 0)) or None,
-                                        notional=float(order.get("notional", notional)) if order.get("notional") is not None else notional,
-                                        realized_pnl=None,
-                                        drawdown=self.state.daily_equity_drawdown_usd,
-                                        raw=order,
+                                    logger.warning(
+                                        "broker order validation failed for %s: %s",
+                                        symbol,
+                                        order,
                                     )
-                                    symbol_result["cooldown_applied"] = True
-                                    logger.info("submitted buy order for %s at %.2f: %s", symbol, entry_price, order)
+                                else:
+                                    confirmed_order, post_trade = await self._confirm_submitted_order(
+                                        symbol,
+                                        "buy",
+                                        order,
+                                        trigger=f"post_buy_submit:{symbol}",
+                                    )
+                                    if post_trade.get("positions") is not None:
+                                        positions = post_trade["positions"]
+                                        position_map = {
+                                            position["symbol"]: position
+                                            for position in positions
+                                            if position.get("symbol")
+                                        }
+                                        open_orders_by_symbol = dict(self.state.open_orders)
+
+                                    if confirmed_order is None:
+                                        symbol_result["reason"] = "buy submission not confirmed by broker"
+                                        symbol_result["blocked_by"].append("broker_reconciliation")
+                                        self.state.record_local_order_attempt(
+                                            symbol,
+                                            self._build_local_order_attempt(order, symbol, "buy"),
+                                        )
+                                        logger.warning(
+                                            "buy submission for %s was not confirmed by broker reconciliation",
+                                            symbol,
+                                        )
+                                    else:
+                                        symbol_result["order"] = confirmed_order
+                                        symbol_result["reason"] = "buy order confirmed by broker"
+                                        symbol_result["broker_order_accepted"] = True
+                                        symbol_result["broker_order_id"] = confirmed_order.get("id")
+                                        symbol_result["broker_order_status"] = confirmed_order.get("status")
+                                        symbol_result["cooldown_applied"] = symbol in self.state.cooldowns
+                                        entry_price = (
+                                            self.state.position_entry_price.get(symbol)
+                                            or self._extract_filled_price(
+                                                confirmed_order,
+                                                float(bars.iloc[-1]["Close"]),
+                                            )
+                                        )
+                                        quantity = self._safe_float(
+                                            confirmed_order.get("filled_qty")
+                                        )
+                                        notional_value = self._safe_float(
+                                            confirmed_order.get("notional")
+                                        )
+                                        if notional_value is None:
+                                            notional_value = notional
+                                        self.persistence.save_order(
+                                            symbol,
+                                            confirmed_order,
+                                            "BUY",
+                                            symbol_result["reason"],
+                                        )
+                                        self.persistence.save_journal_entry(
+                                            symbol=symbol,
+                                            action="BUY",
+                                            reason=symbol_result["reason"],
+                                            entry_price=entry_price,
+                                            exit_price=None,
+                                            quantity=quantity,
+                                            notional=notional_value,
+                                            realized_pnl=None,
+                                            drawdown=self.state.daily_equity_drawdown_usd,
+                                            raw=confirmed_order,
+                                        )
+                                        logger.info(
+                                            "confirmed buy order for %s at %.2f: %s",
+                                            symbol,
+                                            entry_price,
+                                            confirmed_order,
+                                        )
                             except Exception as exc:
                                 symbol_result["reason"] = f"buy error: {exc}"
                                 symbol_result["blocked_by"].append("execution_error")
@@ -354,45 +446,95 @@ class TradingBot:
                             symbol_result["reason"] = "position quantity invalid"
                             symbol_result["blocked_by"].append("invalid_qty")
                         else:
+                            entry_price_before_exit = self.state.position_entry_price.get(symbol)
+                            if entry_price_before_exit is None:
+                                entry_price_before_exit = self._safe_float(
+                                    held_position.get("avg_entry_price")
+                                )
                             try:
                                 order = await self.trading_service.submit_market_sell_qty(symbol, qty)
-                                if not self._validate_order_response(order, symbol, "sell"):
+                                symbol_result["submission_attempted"] = True
+                                symbol_result["broker_order_id"] = order.get("id")
+                                symbol_result["broker_order_status"] = order.get("status")
+                                if not self._validate_order_response(
+                                    order,
+                                    symbol,
+                                    "sell",
+                                    confirmation_path=BROKER_SUBMIT_ORDER_PATH,
+                                ):
                                     symbol_result["reason"] = "broker order validation failed"
                                     symbol_result["blocked_by"].append("broker_validation")
-                                    symbol_result["submission_attempted"] = True
-                                    symbol_result["broker_order_accepted"] = False
-                                    logger.warning("broker order validation failed for %s: %s", symbol, order)
-                                else:
-                                    await self._reconcile_broker_state()
-                                    symbol_result["order"] = order
-                                    symbol_result["reason"] = "sell order accepted by broker"
-                                    symbol_result["submission_attempted"] = True
-                                    symbol_result["broker_order_accepted"] = True
-                                    symbol_result["broker_order_id"] = order.get("id")
-                                    symbol_result["broker_order_status"] = order.get("status")
-                                    exit_price = self._extract_filled_price(order, float(held_position.get("current_price", 0)))
-                                    entry_price = self.state.position_entry_price.get(symbol)
-                                    realized = None
-                                    if entry_price is not None:
-                                        realized = (exit_price - entry_price) * qty
-                                    self.state.record_trade(symbol, self.settings.cooldown_seconds_per_symbol)
-                                    self.state.record_order(symbol, order)
-                                    self.state.clear_entry_price(symbol)
-                                    self.persistence.save_order(symbol, order, "SELL", symbol_result["reason"])
-                                    self.persistence.save_journal_entry(
-                                        symbol=symbol,
-                                        action="SELL",
-                                        reason=symbol_result["reason"],
-                                        entry_price=entry_price,
-                                        exit_price=exit_price,
-                                        quantity=qty,
-                                        notional=float(order.get("filled_avg_price", exit_price)) * qty if exit_price else None,
-                                        realized_pnl=realized,
-                                        drawdown=self.state.daily_equity_drawdown_usd,
-                                        raw=order,
+                                    logger.warning(
+                                        "broker order validation failed for %s: %s",
+                                        symbol,
+                                        order,
                                     )
-                                    symbol_result["cooldown_applied"] = True
-                                    logger.info("submitted sell order for %s: %s", symbol, order)
+                                else:
+                                    confirmed_order, post_trade = await self._confirm_submitted_order(
+                                        symbol,
+                                        "sell",
+                                        order,
+                                        trigger=f"post_sell_submit:{symbol}",
+                                    )
+                                    if post_trade.get("positions") is not None:
+                                        positions = post_trade["positions"]
+                                        position_map = {
+                                            position["symbol"]: position
+                                            for position in positions
+                                            if position.get("symbol")
+                                        }
+                                        open_orders_by_symbol = dict(self.state.open_orders)
+
+                                    if confirmed_order is None:
+                                        symbol_result["reason"] = "sell submission not confirmed by broker"
+                                        symbol_result["blocked_by"].append("broker_reconciliation")
+                                        self.state.record_local_order_attempt(
+                                            symbol,
+                                            self._build_local_order_attempt(order, symbol, "sell"),
+                                        )
+                                        logger.warning(
+                                            "sell submission for %s was not confirmed by broker reconciliation",
+                                            symbol,
+                                        )
+                                    else:
+                                        symbol_result["order"] = confirmed_order
+                                        symbol_result["reason"] = "sell order confirmed by broker"
+                                        symbol_result["broker_order_accepted"] = True
+                                        symbol_result["broker_order_id"] = confirmed_order.get("id")
+                                        symbol_result["broker_order_status"] = confirmed_order.get("status")
+                                        symbol_result["cooldown_applied"] = symbol in self.state.cooldowns
+                                        exit_price = self._extract_filled_price(
+                                            confirmed_order,
+                                            float(held_position.get("current_price", 0)),
+                                        )
+                                        entry_price = entry_price_before_exit
+                                        realized = None
+                                        if entry_price is not None:
+                                            realized = (exit_price - entry_price) * qty
+                                        notional_value = self._safe_float(
+                                            confirmed_order.get("notional")
+                                        )
+                                        if notional_value is None and exit_price:
+                                            notional_value = exit_price * qty
+                                        self.persistence.save_order(
+                                            symbol,
+                                            confirmed_order,
+                                            "SELL",
+                                            symbol_result["reason"],
+                                        )
+                                        self.persistence.save_journal_entry(
+                                            symbol=symbol,
+                                            action="SELL",
+                                            reason=symbol_result["reason"],
+                                            entry_price=entry_price,
+                                            exit_price=exit_price,
+                                            quantity=qty,
+                                            notional=notional_value,
+                                            realized_pnl=realized,
+                                            drawdown=self.state.daily_equity_drawdown_usd,
+                                            raw=confirmed_order,
+                                        )
+                                        logger.info("confirmed sell order for %s: %s", symbol, confirmed_order)
                             except Exception as exc:
                                 symbol_result["reason"] = f"sell error: {exc}"
                                 symbol_result["blocked_by"].append("execution_error")
@@ -410,122 +552,399 @@ class TradingBot:
             self.persistence.save_state(self.state)
             return response
 
-    def _validate_order_response(self, order: dict[str, Any], expected_symbol: str, expected_side: str) -> bool:
-        """Validate that the order response looks like a real Alpaca order."""
-        required_fields = ["id", "symbol", "side", "status", "submitted_at"]
-        for field in required_fields:
-            if field not in order or not order.get(field):
-                return False
-        if order.get("symbol") != expected_symbol:
-            return False
-        if order.get("side") != expected_side:
-            return False
-        # Additional checks if needed
-        return True
+    async def _confirm_submitted_order(
+        self,
+        symbol: str,
+        side: str,
+        submission_order: dict[str, Any],
+        trigger: str,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+        self.state.clear_local_order_attempt(symbol)
+        reconciliation = await self._refresh_broker_state(trigger)
+        confirmed_order = self.state.last_order_by_symbol.get(symbol)
+        if reconciliation.get("error"):
+            return None, reconciliation
+        if confirmed_order is None:
+            return None, reconciliation
+        if confirmed_order.get("id") != submission_order.get("id"):
+            return None, reconciliation
+        if confirmed_order.get("side") != side:
+            return None, reconciliation
+        self.state.clear_local_order_attempt(symbol)
+        return confirmed_order, reconciliation
 
-    def _is_broker_backed_order(self, order: dict[str, Any]) -> bool:
-        """Check if an order dict looks like a real broker-backed order."""
-        return self._validate_order_response(order, order.get("symbol", ""), order.get("side", ""))
+    async def _fetch_broker_snapshot(self) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+        account = await self.trading_service.get_account()
+        positions = await self.trading_service.list_positions()
+        recent_orders = await self.trading_service.list_orders(status="all", limit=100)
+        return account, positions, recent_orders
 
-    async def _reconcile_broker_state(self) -> dict[str, Any]:
-        """Reconcile internal state with broker truth, purging stale state."""
+    async def _refresh_broker_state(self, trigger: str) -> dict[str, Any]:
         try:
-            account = await self.trading_service.get_account()
-            positions = await self.trading_service.list_positions()
-            open_orders = await self.trading_service.list_orders(status="all", limit=100)  # Get recent orders
-
-            # Build broker-backed order set
-            broker_order_ids = {order.get("id") for order in open_orders if order.get("id")}
-            broker_positions = {pos["symbol"]: pos for pos in positions}
-
-            # Purge stale last_order_by_symbol
-            stale_orders_cleared = 0
-            for symbol, order in list(self.state.last_order_by_symbol.items()):
-                if not self._is_broker_backed_order(order):
-                    del self.state.last_order_by_symbol[symbol]
-                    stale_orders_cleared += 1
-                elif order.get("id") not in broker_order_ids:
-                    # Order not in recent broker orders, might be filled/canceled
-                    if symbol not in broker_positions:
-                        # No position, so order is stale
-                        del self.state.last_order_by_symbol[symbol]
-                        stale_orders_cleared += 1
-
-            # Recompute entry prices from positions
-            for symbol, pos in broker_positions.items():
-                entry_price = pos.get("avg_entry_price") or pos.get("current_price")
-                if entry_price:
-                    try:
-                        self.state.position_entry_price[symbol] = float(entry_price)
-                    except (TypeError, ValueError):
-                        pass
-
-            # Clear entry prices for symbols not in positions
-            for symbol in list(self.state.position_entry_price.keys()):
-                if symbol not in broker_positions:
-                    del self.state.position_entry_price[symbol]
-
-            # Recompute open_orders
-            self.state.open_orders = {
-                order.get("symbol", ""): order for order in open_orders if order.get("symbol")
+            account, positions, recent_orders = await self._fetch_broker_snapshot()
+        except Exception as exc:
+            logger.warning("Broker reconciliation failed during %s: %s", trigger, exc)
+            self.state.broker_state_consistent = False
+            return {
+                "trigger": trigger,
+                "error": str(exc),
+                "broker_state_consistent": False,
             }
 
-            # Recompute total_portfolio_exposure_usd
-            self.state.total_portfolio_exposure_usd = sum(
-                abs(float(pos.get("market_value", 0))) for pos in positions
+        summary = self._rebuild_state_from_broker_truth(
+            account=account,
+            positions=positions,
+            recent_orders=recent_orders,
+            trigger=trigger,
+        )
+        logger.info("reconciled broker state: %s", summary)
+        return summary
+
+    def _rebuild_state_from_broker_truth(
+        self,
+        account: dict[str, Any],
+        positions: list[dict[str, Any]],
+        recent_orders: list[dict[str, Any]],
+        trigger: str,
+    ) -> dict[str, Any]:
+        now = datetime.now(timezone.utc)
+        current_day = self.state.daily_order_date or date.today()
+
+        confirmed_orders: list[dict[str, Any]] = []
+        invalid_broker_orders_ignored = 0
+        for order in recent_orders:
+            normalized_order = self._normalize_broker_order(
+                order,
+                confirmation_path=BROKER_LIST_ORDERS_PATH,
+            )
+            if normalized_order is None:
+                invalid_broker_orders_ignored += 1
+                continue
+            confirmed_orders.append(normalized_order)
+
+        confirmed_orders.sort(key=self._order_sort_key, reverse=True)
+        confirmed_positions = [position for position in positions if position.get("symbol")]
+        broker_positions = {
+            position["symbol"]: position for position in confirmed_positions if position.get("symbol")
+        }
+
+        last_order_by_symbol: dict[str, dict[str, Any]] = {}
+        open_orders_by_symbol: dict[str, dict[str, Any]] = {}
+        for order in confirmed_orders:
+            symbol = order["symbol"]
+            last_order_by_symbol.setdefault(symbol, order)
+            if self._is_open_order(order) and symbol not in open_orders_by_symbol:
+                open_orders_by_symbol[symbol] = order
+
+        position_entry_price: dict[str, float] = {}
+        for symbol, position in broker_positions.items():
+            entry_price = position.get("avg_entry_price") or position.get("current_price")
+            parsed_entry_price = self._safe_float(entry_price)
+            if parsed_entry_price is not None:
+                position_entry_price[symbol] = parsed_entry_price
+
+        daily_order_count, daily_symbol_trade_count = self._compute_daily_counts(
+            confirmed_orders,
+            current_day,
+        )
+
+        cooldowns: dict[str, datetime] = {}
+        for order in confirmed_orders:
+            submitted_at = self._parse_timestamp(order.get("submitted_at"))
+            if submitted_at is None:
+                continue
+            cooldown_expires_at = submitted_at + timedelta(
+                seconds=self._cooldown_seconds_for_order(order)
+            )
+            if cooldown_expires_at <= now:
+                continue
+            symbol = order["symbol"]
+            existing_expires_at = cooldowns.get(symbol)
+            if existing_expires_at is None or cooldown_expires_at > existing_expires_at:
+                cooldowns[symbol] = cooldown_expires_at
+
+        previous_last_orders = dict(self.state.last_order_by_symbol)
+        previous_cooldowns = dict(self.state.cooldowns)
+        previous_entry_prices = dict(self.state.position_entry_price)
+        previous_daily_order_count = self.state.daily_order_count
+        previous_daily_symbol_trade_count = dict(self.state.daily_symbol_trade_count)
+        previous_local_attempts = dict(self.state.local_order_attempts_by_symbol)
+
+        stale_orders_cleared = 0
+        untrusted_local_orders_discarded = len(previous_local_attempts)
+        for symbol, order in previous_last_orders.items():
+            if not self._is_confirmed_order_state(order):
+                stale_orders_cleared += 1
+                untrusted_local_orders_discarded += 1
+                continue
+            confirmed_order = last_order_by_symbol.get(symbol)
+            if confirmed_order is None or confirmed_order.get("id") != order.get("id"):
+                stale_orders_cleared += 1
+
+        cooldowns_cleared = sum(
+            1 for symbol in previous_cooldowns if symbol not in cooldowns
+        )
+        entry_prices_cleared = sum(
+            1 for symbol in previous_entry_prices if symbol not in position_entry_price
+        )
+        trade_counts_recomputed = (
+            previous_daily_order_count != daily_order_count
+            or previous_daily_symbol_trade_count != daily_symbol_trade_count
+        )
+
+        stale_state_detected = any(
+            [
+                stale_orders_cleared,
+                cooldowns_cleared,
+                entry_prices_cleared,
+                untrusted_local_orders_discarded,
+                trade_counts_recomputed,
+            ]
+        )
+        stale_state_cleared_count = (
+            stale_orders_cleared
+            + cooldowns_cleared
+            + entry_prices_cleared
+            + untrusted_local_orders_discarded
+            + int(trade_counts_recomputed)
+        )
+
+        self.state.last_order_by_symbol = last_order_by_symbol
+        self.state.local_order_attempts_by_symbol = {}
+        self.state.recent_orders = confirmed_orders[:50]
+        self.state.open_orders = open_orders_by_symbol
+        self.state.cooldowns = cooldowns
+        self.state.position_entry_price = position_entry_price
+        self.state.total_portfolio_exposure_usd = sum(
+            abs(float(position.get("market_value", 0))) for position in confirmed_positions
+        )
+        self.state.daily_order_count = daily_order_count
+        self.state.daily_symbol_trade_count = daily_symbol_trade_count
+        self.state.confirmed_open_orders = len(open_orders_by_symbol)
+        self.state.confirmed_positions = len(broker_positions)
+        self.state.untrusted_local_orders_discarded = untrusted_local_orders_discarded
+        self.state.stale_state_detected = stale_state_detected
+        self.state.stale_state_cleared_count = stale_state_cleared_count
+        self.state.last_reconciled_at = now
+        self.state.broker_state_consistent = True
+
+        self.persistence.save_positions(confirmed_positions)
+        for order in confirmed_orders:
+            self.persistence.save_order(
+                order.get("symbol", ""),
+                order,
+                str(order.get("side", "order")).upper(),
+                f"broker reconciliation ({trigger})",
             )
 
-            # Recompute daily_order_count and daily_symbol_trade_count from broker orders
-            today = self.state.daily_order_date
-            if today:
-                today_str = today.isoformat()
-                broker_orders_today = [
-                    order for order in open_orders
-                    if order.get("submitted_at", "").startswith(today_str[:10])  # Date match
-                ]
-                self.state.daily_order_count = len(broker_orders_today)
-                self.state.daily_symbol_trade_count = {}
-                for order in broker_orders_today:
-                    symbol = order.get("symbol", "")
-                    if symbol:
-                        self.state.daily_symbol_trade_count[symbol] = self.state.daily_symbol_trade_count.get(symbol, 0) + 1
+        return {
+            "trigger": trigger,
+            "stale_orders_cleared": stale_orders_cleared,
+            "cooldowns_cleared": cooldowns_cleared,
+            "entry_prices_cleared": entry_prices_cleared,
+            "trade_counts_recomputed": trade_counts_recomputed,
+            "positions_synced": len(confirmed_positions),
+            "confirmed_positions": len(broker_positions),
+            "open_orders_synced": len(open_orders_by_symbol),
+            "confirmed_open_orders": len(open_orders_by_symbol),
+            "daily_order_count_recomputed": daily_order_count,
+            "daily_symbol_trade_count_recomputed": daily_symbol_trade_count,
+            "stale_state_detected": stale_state_detected,
+            "stale_state_cleared_count": stale_state_cleared_count,
+            "untrusted_local_orders_discarded": untrusted_local_orders_discarded,
+            "invalid_broker_orders_ignored": invalid_broker_orders_ignored,
+            "broker_state_consistent": True,
+            "state_last_reconciled_at": now,
+            "account": account,
+            "positions": confirmed_positions,
+            "confirmed_orders": confirmed_orders,
+        }
 
-            # Clear cooldowns not backed by recent orders or positions
-            cooldowns_cleared = 0
-            for symbol in list(self.state.cooldowns.keys()):
-                has_recent_order = any(
-                    order.get("symbol") == symbol and order.get("submitted_at", "").startswith(today_str[:10] if today else "")
-                    for order in open_orders
-                )
-                has_position = symbol in broker_positions
-                if not (has_recent_order or has_position):
-                    del self.state.cooldowns[symbol]
-                    cooldowns_cleared += 1
+    def _compute_daily_counts(
+        self,
+        orders: list[dict[str, Any]],
+        current_day: date,
+    ) -> tuple[int, dict[str, int]]:
+        total = 0
+        per_symbol: dict[str, int] = {}
+        for order in orders:
+            submitted_at = self._parse_timestamp(order.get("submitted_at"))
+            if submitted_at is None:
+                continue
+            if submitted_at.astimezone().date() != current_day:
+                continue
+            total += 1
+            symbol = order.get("symbol")
+            if symbol:
+                per_symbol[symbol] = per_symbol.get(symbol, 0) + 1
+        return total, per_symbol
 
-            # Save positions
-            self.persistence.save_positions(positions)
-            for order in open_orders:
-                symbol = order.get("symbol", "")
-                self.persistence.save_order(symbol, order, order.get("side", "order"), "reconciled open order")
+    def _cooldown_seconds_for_order(self, order: dict[str, Any]) -> int:
+        if order.get("side") == "sell":
+            return self.settings.post_exit_cooldown_seconds
+        return self.settings.cooldown_seconds_per_symbol
 
-            summary = {
-                "stale_orders_cleared": stale_orders_cleared,
-                "cooldowns_cleared": cooldowns_cleared,
-                "positions_synced": len(positions),
-                "open_orders_synced": len(open_orders),
-                "daily_order_count_recomputed": self.state.daily_order_count,
-                "broker_state_consistent": True,
-            }
-            self.state.last_reconciled_at = datetime.now(timezone.utc)
-            self.state.broker_state_consistent = True
-            logger.info("reconciled broker state: %s", summary)
-            return summary
-        except Exception as exc:
-            logger.warning("Broker reconciliation failed: %s", exc)
-            self.state.broker_state_consistent = False
-            return {"error": str(exc), "broker_state_consistent": False}
+    def _is_open_order(self, order: dict[str, Any]) -> bool:
+        status = str(order.get("status", "")).lower()
+        return status in OPEN_ORDER_STATUSES
 
-    def _build_response(self, run_time: datetime, results: list[dict[str, Any]], account: dict[str, Any], positions: list[dict[str, Any]]) -> dict[str, Any]:
+    def _order_sort_key(self, order: dict[str, Any]) -> float:
+        submitted_at = self._parse_timestamp(order.get("submitted_at"))
+        if submitted_at is None:
+            return 0.0
+        return submitted_at.timestamp()
+
+    def _validate_order_response(
+        self,
+        order: dict[str, Any],
+        expected_symbol: str,
+        expected_side: str,
+        confirmation_path: str = BROKER_SUBMIT_ORDER_PATH,
+    ) -> bool:
+        return (
+            self._normalize_broker_order(
+                order,
+                confirmation_path=confirmation_path,
+                expected_symbol=expected_symbol,
+                expected_side=expected_side,
+            )
+            is not None
+        )
+
+    def _normalize_broker_order(
+        self,
+        order: dict[str, Any],
+        confirmation_path: str,
+        expected_symbol: str | None = None,
+        expected_side: str | None = None,
+    ) -> dict[str, Any] | None:
+        if not isinstance(order, dict):
+            return None
+
+        order_id = order.get("id")
+        symbol = order.get("symbol")
+        side = order.get("side")
+        status = order.get("status")
+        submitted_at = self._parse_timestamp(order.get("submitted_at"))
+        if not self._looks_like_broker_order_id(order_id):
+            return None
+        if not isinstance(symbol, str) or not symbol:
+            return None
+        if side not in {"buy", "sell"}:
+            return None
+        if not isinstance(status, str) or not status:
+            return None
+        if submitted_at is None:
+            return None
+        if expected_symbol is not None and symbol != expected_symbol:
+            return None
+        if expected_side is not None and side != expected_side:
+            return None
+
+        normalized_order = dict(order)
+        normalized_order["submitted_at"] = self._format_timestamp(submitted_at)
+        normalized_order["source"] = "broker"
+        normalized_order["confirmation_path"] = confirmation_path
+        normalized_order["broker_confirmed"] = True
+        return normalized_order
+
+    def _is_confirmed_order_state(self, order: dict[str, Any]) -> bool:
+        if not isinstance(order, dict):
+            return False
+        if order.get("source") != "broker":
+            return False
+        if order.get("broker_confirmed") is not True:
+            return False
+        if order.get("confirmation_path") != BROKER_LIST_ORDERS_PATH:
+            return False
+        normalized_order = self._normalize_broker_order(
+            order,
+            confirmation_path=BROKER_LIST_ORDERS_PATH,
+            expected_symbol=order.get("symbol"),
+            expected_side=order.get("side"),
+        )
+        return normalized_order is not None
+
+    def _build_local_order_attempt(
+        self,
+        order: dict[str, Any],
+        symbol: str,
+        side: str,
+    ) -> dict[str, Any]:
+        submitted_at = self._parse_timestamp(order.get("submitted_at")) or datetime.now(timezone.utc)
+        return {
+            "id": order.get("id"),
+            "symbol": symbol,
+            "side": side,
+            "status": order.get("status"),
+            "submitted_at": self._format_timestamp(submitted_at),
+            "source": "local",
+            "confirmation_path": LOCAL_PENDING_ORDER_PATH,
+            "broker_confirmed": False,
+        }
+
+    def _looks_like_broker_order_id(self, order_id: Any) -> bool:
+        if not isinstance(order_id, str) or not order_id.strip():
+            return False
+        try:
+            normalized_uuid = str(UUID(order_id))
+        except (TypeError, ValueError):
+            return False
+        return normalized_uuid == order_id.lower()
+
+    def _parse_timestamp(self, value: Any) -> datetime | None:
+        if isinstance(value, datetime):
+            parsed = value
+        elif isinstance(value, str) and value:
+            try:
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+        else:
+            return None
+
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    def _format_timestamp(self, value: datetime) -> str:
+        normalized = value.astimezone(timezone.utc).replace(microsecond=0)
+        return normalized.isoformat().replace("+00:00", "Z")
+
+    def _safe_float(self, value: Any) -> float | None:
+        try:
+            if value is None:
+                return None
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _extract_filled_price(self, order: dict[str, Any], fallback: float) -> float:
+        filled_avg_price = self._safe_float(order.get("filled_avg_price"))
+        if filled_avg_price is None or filled_avg_price <= 0:
+            return fallback
+        return filled_avg_price
+
+    def has_suspicious_state(self) -> bool:
+        return self._count_untrusted_runtime_orders() > 0
+
+    def _count_untrusted_runtime_orders(self) -> int:
+        count = 0
+        for order in self.state.last_order_by_symbol.values():
+            if not self._is_confirmed_order_state(order):
+                count += 1
+        for order in self.state.open_orders.values():
+            if not self._is_confirmed_order_state(order):
+                count += 1
+        return count
+
+    def _build_response(
+        self,
+        run_time: datetime,
+        results: list[dict[str, Any]],
+        account: dict[str, Any],
+        positions: list[dict[str, Any]],
+    ) -> dict[str, Any]:
         self.state.last_run_time = run_time
         self.state.last_results = {"symbols": results}
         return {
@@ -579,13 +998,19 @@ class TradingBot:
 
     async def resume(self) -> None:
         if self.state.risk_stop_latched and self.state.halted_reason == "max daily loss exceeded":
-            logger.warning("resume requested but max daily loss stop remains latched; call /bot/reset-risk to clear")
+            logger.warning(
+                "resume requested but max daily loss stop remains latched; call /bot/reset-risk to clear"
+            )
             return
         self.state.resume()
         logger.info("bot resumed")
 
     async def reset_risk(self) -> None:
-        account = await self.trading_service.get_account()
+        reconciliation = await self._refresh_broker_state("reset_risk")
+        account = reconciliation.get("account")
+        if account is None:
+            account = await self.trading_service.get_account()
+
         equity = Decimal(str(account.get("equity", account.get("cash", "0"))))
         self.state.reset_risk_state(float(equity))
         if self.state.halted_reason == "max daily loss exceeded":
@@ -594,6 +1019,7 @@ class TradingBot:
         logger.info("risk state reset using current equity %.2f", float(equity))
 
     def status(self) -> dict[str, Any]:
+        suspicious_state = self.has_suspicious_state()
         return {
             "running": self.state.running,
             "mode": self.state.mode,
@@ -617,6 +1043,12 @@ class TradingBot:
             "daily_symbol_trade_count": self.state.daily_symbol_trade_count,
             "last_signal_by_symbol": self.state.last_signal_by_symbol,
             "last_order_by_symbol": self.state.last_order_by_symbol,
-            "state_last_reconciled_at": getattr(self.state, 'last_reconciled_at', None),
-            "broker_state_consistent": getattr(self.state, 'broker_state_consistent', True),
+            "local_order_attempts_by_symbol": self.state.local_order_attempts_by_symbol,
+            "state_last_reconciled_at": self.state.last_reconciled_at,
+            "broker_state_consistent": self.state.broker_state_consistent and not suspicious_state,
+            "stale_state_detected": self.state.stale_state_detected or suspicious_state,
+            "stale_state_cleared_count": self.state.stale_state_cleared_count,
+            "confirmed_open_orders": self.state.confirmed_open_orders,
+            "confirmed_positions": self.state.confirmed_positions,
+            "untrusted_local_orders_discarded": self.state.untrusted_local_orders_discarded,
         }

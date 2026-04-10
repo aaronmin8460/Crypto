@@ -9,6 +9,7 @@ A Python FastAPI application for Alpaca crypto trading. This repo now includes a
 - Requires explicit opt-in for live trading
 - Persists bot state in a local SQLite file
 - Tracks last run time, cooldowns, entry prices, orders, positions, and drawdown
+- Treats broker truth as the source of truth for positions, orders, cooldowns, and daily trade counts
 - Reconciles broker state on startup to avoid duplicate orders after restart
 - Uses SMA trend logic enhanced with volume, volatility, and RSI filters
 - Supports configurable sizing via fixed notional, percent equity, or ATR-adjusted sizing
@@ -54,6 +55,7 @@ If port `8000` is already in use, add `--port 8001`.
 - `POST /bot/halt` pauses trading with an emergency reason
 - `POST /bot/resume` clears a manual halt state
 - `POST /bot/reset-risk` clears a daily loss stop and recomputes risk using current equity
+- `POST /bot/reconcile-state` rebuilds internal bot state from broker truth
 
 ## Important endpoints
 
@@ -82,7 +84,7 @@ curl http://127.0.0.1:8000/health
 curl http://127.0.0.1:8000/config
 curl -X POST http://127.0.0.1:8000/run-once
 curl -X POST http://127.0.0.1:8000/bot/start
-curl -X POST http://127.0.0.1:8000/bot/status
+curl http://127.0.0.1:8000/bot/status
 curl -X POST http://127.0.0.1:8000/bot/halt
 curl -X POST http://127.0.0.1:8000/bot/resume
 curl -X POST http://127.0.0.1:8000/bot/reset-risk
@@ -100,7 +102,8 @@ curl http://127.0.0.1:8000/performance
   - open orders and broker positions
   - recent orders
   - trade journal entries
-- On restart, the bot reconciles open Alpaca positions and orders to avoid duplicate trades.
+- On restart, the bot reconciles Alpaca account, recent orders, and positions before using persisted trading state.
+- Placeholder or stale local paper-testing state that is not confirmed by the broker is purged during reconciliation.
 
 ## Risk controls
 
@@ -109,23 +112,38 @@ curl http://127.0.0.1:8000/performance
 - `max_intraday_drawdown_usd` tracks the worst peak-to-trough drawdown seen today
 - `MAX_DAILY_LOSS_USD` is latched for the remainder of the trading day once breached
 - `POST /bot/resume` does not clear a true daily loss stop; use `POST /bot/reset-risk` to recover
+- `POST /bot/reset-risk` resets drawdown and risk latch state, then refreshes broker-backed state so bogus order memory does not linger
 - Per-symbol trade count limits
 - Portfolio and symbol exposure limits
 - Optional higher-timeframe confirmation
 - RSI-based overbought filtering
 - ATR-based sizing and stop functionality
 
-## Order execution and broker consistency
+## Broker truth and reconciliation
 
 - **Signal generated**: Strategy indicates BUY or SELL
 - **Submission attempted**: Order payload sent to Alpaca
-- **Broker accepted**: Alpaca returns valid order with `id`, `symbol`, `side`, `status`, `submitted_at`
+- **Broker response validated**: Alpaca returns a realistic order record with `id`, `symbol`, `side`, `status`, and `submitted_at`
+- **Broker confirmed**: A follow-up broker reconciliation sees the order in Alpaca `list_orders`
 - **Filled**: Order reaches `filled` status (may happen later)
 - **Position confirmed**: Broker positions reflect the trade
-- Only broker-accepted orders update internal state (cooldowns, counts, entry prices)
-- Broker state is reconciled after every trade attempt and at startup
-- Broker truth wins over internal memory; fake responses do not create state changes
-- Debug divergences by comparing `/bot/status`, `/orders`, `/positions`, and `/account`
+- Broker truth wins over internal memory. Reconciliation rebuilds:
+  - confirmed open orders
+  - confirmed positions
+  - `last_order_by_symbol`
+  - `daily_order_count`
+  - `daily_symbol_trade_count`
+  - cooldowns
+  - entry prices
+- Fake or stale local orders such as placeholder IDs like `12345` are discarded automatically.
+- Broker state is reconciled at startup, before trading decisions, after validated submission attempts, on `POST /bot/reconcile-state`, and when `/bot/status` detects structurally suspicious local order state.
+- Unconfirmed local submit responses are kept separate from broker-confirmed state under `local_order_attempts_by_symbol`.
+
+## `reset-risk` vs `reconcile-state`
+
+- `POST /bot/reset-risk` clears the daily loss latch and re-anchors risk tracking to current equity. It is for recovering from a risk halt.
+- `POST /bot/reconcile-state` does not reset risk history. It pulls fresh broker truth and purges stale local order, cooldown, counter, and entry-price state.
+- Use `POST /bot/reconcile-state` first when `/bot/status` disagrees with `/orders`, `/positions`, or `/account`.
 
 ## Strategy configuration
 
@@ -155,7 +173,15 @@ New configurable settings include:
 
 - If the bot reports `account not healthy`, confirm your Alpaca account status and `REQUIRE_HEALTHY_ACCOUNT` configuration.
 - If trading is disabled, verify `TRADING_ENABLED=true` and that paper mode is configured as expected.
+- If `/bot/status` shows stale order metadata but `/orders` and `/positions` are empty, call `POST /bot/reconcile-state` and check:
+  - `broker_state_consistent`
+  - `stale_state_detected`
+  - `stale_state_cleared_count`
+  - `confirmed_open_orders`
+  - `confirmed_positions`
+  - `untrusted_local_orders_discarded`
 - If the bot does not place orders after restart, check the `open_orders` state and broker reconciliation logs.
+- Debug mismatches by comparing `/bot/status`, `/orders`, `/positions`, and `/account`. After a successful reconciliation they should be logically consistent.
 - For strategy tuning, inspect the `filters` and `indicators` fields in `POST /run-once` responses.
 
 ## Changelog

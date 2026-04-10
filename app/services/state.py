@@ -20,6 +20,7 @@ class BotState(BaseModel):
     open_orders: dict[str, dict[str, Any]] = Field(default_factory=dict)
     last_signal_by_symbol: dict[str, str] = Field(default_factory=dict)
     last_order_by_symbol: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    local_order_attempts_by_symbol: dict[str, dict[str, Any]] = Field(default_factory=dict)
     recent_orders: list[dict[str, Any]] = Field(default_factory=list)
     daily_order_count: int = 0
     daily_symbol_trade_count: dict[str, int] = Field(default_factory=dict)
@@ -36,6 +37,11 @@ class BotState(BaseModel):
     position_entry_price: dict[str, float] = Field(default_factory=dict)
     last_reconciled_at: datetime | None = None
     broker_state_consistent: bool = True
+    stale_state_detected: bool = False
+    stale_state_cleared_count: int = 0
+    confirmed_open_orders: int = 0
+    confirmed_positions: int = 0
+    untrusted_local_orders_discarded: int = 0
 
     def can_trade(self, symbol: str) -> bool:
         if self.halted_reason:
@@ -84,6 +90,12 @@ class BotState(BaseModel):
         if len(self.recent_orders) > 50:
             self.recent_orders.pop(0)
 
+    def record_local_order_attempt(self, symbol: str, order: dict[str, Any]) -> None:
+        self.local_order_attempts_by_symbol[symbol] = order
+
+    def clear_local_order_attempt(self, symbol: str) -> None:
+        self.local_order_attempts_by_symbol.pop(symbol, None)
+
     def record_entry_price(self, symbol: str, price: float) -> None:
         self.position_entry_price[symbol] = price
 
@@ -129,6 +141,7 @@ class BotState(BaseModel):
             self.risk_stop_latched = False
             self.last_equity = None
             self.position_entry_price.clear()
+            self.local_order_attempts_by_symbol.clear()
             if self.halted_reason == "max daily loss exceeded":
                 self.halted_reason = None
 

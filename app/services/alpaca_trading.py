@@ -44,8 +44,8 @@ class AlpacaTrading:
     async def list_positions(self) -> list[dict]:
         return await self._request("GET", "/v2/positions")
 
-    async def list_orders(self, status: str = "all") -> list[dict]:
-        params = {"status": status, "limit": 50}
+    async def list_orders(self, status: str = "all", limit: int = 50) -> list[dict]:
+        params = {"status": status, "limit": limit}
         return await self._request("GET", "/v2/orders", params=params)
 
     async def submit_market_buy_notional(self, symbol: str, notional: float) -> dict:
